@@ -1,3 +1,3 @@
-module github.com/kran/cho
+module codeberg.org/kran/cho
 
 go 1.24

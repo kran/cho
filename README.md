@@ -7,7 +7,7 @@ Zero external dependencies. ~600 lines of code across 4 files.
 ## Install
 
 ```
-go get github.com/kran/cho
+go get codeberg.org/kran/cho
 ```
 
 ## Usage
@@ -17,7 +17,7 @@ package main
 
 import (
     "net/http"
-    "github.com/kran/cho"
+    "codeberg.org/kran/cho"
 )
 
 type AppContext struct {
