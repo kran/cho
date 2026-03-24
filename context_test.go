@@ -83,7 +83,7 @@ func TestRemoteIPTrustedProxy(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx, _ := makeCtx("GET", "/", "")
-			ctx.trustedProxies = []*net.IPNet{trusted, proxy2}
+			ctx.cfg = &contextConfig{TrustedProxies: []*net.IPNet{trusted, proxy2}}
 			if tt.xff != "" {
 				ctx.R.Header.Set("X-Forwarded-For", tt.xff)
 			}

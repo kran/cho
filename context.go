@@ -31,26 +31,24 @@ type Validatable interface {
 // BaseContext is the default Context implementation. Embed it in your own context struct
 // to satisfy the Context interface and gain helper methods.
 type BaseContext struct {
-	W              http.ResponseWriter
-	R              *http.Request
-	validator      func(any) error
-	trustedProxies []*net.IPNet
+	W   http.ResponseWriter
+	R   *http.Request
+	cfg *contextConfig
 }
 
-func (b *BaseContext) setValidator(fn func(any) error) {
-	b.validator = fn
-}
-
-func (b *BaseContext) setTrustedProxies(nets []*net.IPNet) {
-	b.trustedProxies = nets
+func (b *BaseContext) setConfig(c *contextConfig) {
+	b.cfg = c
 }
 
 func (b *BaseContext) isTrusted(ipStr string) bool {
+	if b.cfg == nil {
+		return false
+	}
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
 		return false
 	}
-	for _, n := range b.trustedProxies {
+	for _, n := range b.cfg.TrustedProxies {
 		if n.Contains(ip) {
 			return true
 		}
@@ -64,8 +62,8 @@ func (b *BaseContext) runValidation(v any) error {
 			return err
 		}
 	}
-	if b.validator != nil {
-		return b.validator(v)
+	if b.cfg != nil && b.cfg.Validator != nil {
+		return b.cfg.Validator(v)
 	}
 	return nil
 }
@@ -117,7 +115,7 @@ func (b *BaseContext) RemoteIP() string {
 	host, _, _ := net.SplitHostPort(b.R.RemoteAddr)
 
 	// No trusted proxies configured — safe default, ignore headers
-	if len(b.trustedProxies) == 0 {
+	if b.cfg == nil || len(b.cfg.TrustedProxies) == 0 {
 		return host
 	}
 

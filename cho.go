@@ -48,16 +48,26 @@ func NewHTTPError(code int, msg ...string) *HTTPError {
 	return &HTTPError{Code: code, Message: m}
 }
 
+// contextConfig holds app-level configuration injected into BaseContext per request.
+type contextConfig struct {
+	Validator      func(any) error
+	TrustedProxies []*net.IPNet
+}
+
+// contextConfigurer is implemented by BaseContext to receive app-level config.
+type contextConfigurer interface {
+	setConfig(*contextConfig)
+}
+
 // Cho is a generic HTTP framework built on top of Go's standard net/http.
 type Cho[T Context] struct {
-	mux            *http.ServeMux
-	contextMaker   ContextMaker[T]
-	middlewares    []Middleware[T]
-	prefix         string
-	ErrorHandler   ErrorHandler[T]
-	NotFound       Handler[T]
-	Validator      func(any) error
-	trustedProxies []*net.IPNet
+	mux          *http.ServeMux
+	contextMaker ContextMaker[T]
+	middlewares  []Middleware[T]
+	prefix       string
+	cfg          contextConfig
+	ErrorHandler ErrorHandler[T]
+	NotFound     Handler[T]
 }
 
 // SetTrustedProxies configures which proxy IPs/CIDRs are trusted for
@@ -86,14 +96,14 @@ func (c *Cho[T]) SetTrustedProxies(cidrs []string) error {
 			nets = append(nets, cidr)
 		}
 	}
-	c.trustedProxies = nets
+	c.cfg.TrustedProxies = nets
 	return nil
 }
 
-// contextConfigurer is implemented by BaseContext to receive app-level config.
-type contextConfigurer interface {
-	setValidator(func(any) error)
-	setTrustedProxies([]*net.IPNet)
+// SetValidator configures a validation function that runs automatically
+// after BindJson, BindQuery, and BindForm.
+func (c *Cho[T]) SetValidator(fn func(any) error) {
+	c.cfg.Validator = fn
 }
 
 // New creates a new Cho instance with the given context maker.
@@ -186,13 +196,12 @@ func (c *Cho[T]) Use(mws ...Middleware[T]) {
 // Group creates a route group with prefix and middleware inheritance.
 func (c *Cho[T]) Group(prefix string, fn func(g *Cho[T])) {
 	sub := &Cho[T]{
-		mux:            c.mux,
-		contextMaker:   c.contextMaker,
-		middlewares:    append([]Middleware[T]{}, c.middlewares...),
-		prefix:         normalizePath(c.prefix + prefix),
-		ErrorHandler:   c.ErrorHandler,
-		Validator:      c.Validator,
-		trustedProxies: c.trustedProxies,
+		mux:          c.mux,
+		contextMaker: c.contextMaker,
+		middlewares:  append([]Middleware[T]{}, c.middlewares...),
+		prefix:       normalizePath(c.prefix + prefix),
+		cfg:          c.cfg,
+		ErrorHandler: c.ErrorHandler,
 	}
 	fn(sub)
 }
@@ -207,12 +216,7 @@ func (c *Cho[T]) Handle(method, path string, handler Handler[T], mws ...Middlewa
 		gw := &guardWriter{ResponseWriter: w}
 		ctx := c.contextMaker(gw, r)
 		if cc, ok := any(ctx).(contextConfigurer); ok {
-			if c.Validator != nil {
-				cc.setValidator(c.Validator)
-			}
-			if c.trustedProxies != nil {
-				cc.setTrustedProxies(c.trustedProxies)
-			}
+			cc.setConfig(&c.cfg)
 		}
 
 		// Wrap handler: convert errors to HTTP responses at the innermost level

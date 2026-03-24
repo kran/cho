@@ -225,9 +225,9 @@ Two mechanisms, usable independently or together:
 import "github.com/go-playground/validator/v10"
 
 var validate = validator.New()
-app.Validator = func(v any) error {
+app.SetValidator(func(v any) error {
     return validate.Struct(v)
-}
+})
 
 type LoginReq struct {
     Email    string `json:"email"    validate:"required,email"`
