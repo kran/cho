@@ -219,14 +219,17 @@ Response:
 
 Two mechanisms, usable independently or together:
 
-**Pluggable Validator** — set once, applies to all Bind methods:
+**Pluggable Validator** — set in your ContextMaker, applies to all Bind methods:
 
 ```go
 import "github.com/go-playground/validator/v10"
 
 var validate = validator.New()
-app.SetValidator(func(v any) error {
-    return validate.Struct(v)
+
+app := cho.New(func(w http.ResponseWriter, r *http.Request) *AppContext {
+    ctx := &AppContext{BaseContext: *cho.MakeBaseContext(w, r)}
+    ctx.SetValidator(validate.Struct)
+    return ctx
 })
 
 type LoginReq struct {

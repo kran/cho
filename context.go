@@ -31,24 +31,30 @@ type Validatable interface {
 // BaseContext is the default Context implementation. Embed it in your own context struct
 // to satisfy the Context interface and gain helper methods.
 type BaseContext struct {
-	W   http.ResponseWriter
-	R   *http.Request
-	cfg *contextConfig
+	W              http.ResponseWriter
+	R              *http.Request
+	validator      func(any) error
+	trustedProxies []*net.IPNet
 }
 
-func (b *BaseContext) setConfig(c *contextConfig) {
-	b.cfg = c
+// SetValidator configures a validation function that runs automatically
+// after BindJson, BindQuery, and BindForm.
+func (b *BaseContext) SetValidator(fn func(any) error) {
+	b.validator = fn
+}
+
+// SetTrustedProxies configures which proxy IPs are trusted for
+// X-Forwarded-For and X-Real-IP header parsing in RemoteIP().
+func (b *BaseContext) SetTrustedProxies(nets []*net.IPNet) {
+	b.trustedProxies = nets
 }
 
 func (b *BaseContext) isTrusted(ipStr string) bool {
-	if b.cfg == nil {
-		return false
-	}
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
 		return false
 	}
-	for _, n := range b.cfg.TrustedProxies {
+	for _, n := range b.trustedProxies {
 		if n.Contains(ip) {
 			return true
 		}
@@ -62,8 +68,8 @@ func (b *BaseContext) runValidation(v any) error {
 			return err
 		}
 	}
-	if b.cfg != nil && b.cfg.Validator != nil {
-		return b.cfg.Validator(v)
+	if b.validator != nil {
+		return b.validator(v)
 	}
 	return nil
 }
@@ -115,7 +121,7 @@ func (b *BaseContext) RemoteIP() string {
 	host, _, _ := net.SplitHostPort(b.R.RemoteAddr)
 
 	// No trusted proxies configured — safe default, ignore headers
-	if b.cfg == nil || len(b.cfg.TrustedProxies) == 0 {
+	if len(b.trustedProxies) == 0 {
 		return host
 	}
 
