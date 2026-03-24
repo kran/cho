@@ -3,13 +3,18 @@ package cho
 import (
 	"encoding/json"
 	"fmt"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gorilla/schema"
 )
+
+var formDecoder = schema.NewDecoder()
 
 // Context is the interface that all Cho handler contexts must implement.
 type Context interface {
@@ -17,11 +22,34 @@ type Context interface {
 	Res() http.ResponseWriter
 }
 
+// Validatable can be implemented by request structs to provide custom validation logic.
+// If a bound struct implements this interface, Validate is called automatically after binding.
+type Validatable interface {
+	Validate() error
+}
+
 // BaseContext is the default Context implementation. Embed it in your own context struct
 // to satisfy the Context interface and gain helper methods.
 type BaseContext struct {
-	W http.ResponseWriter
-	R *http.Request
+	W         http.ResponseWriter
+	R         *http.Request
+	validator func(any) error
+}
+
+func (b *BaseContext) setValidator(fn func(any) error) {
+	b.validator = fn
+}
+
+func (b *BaseContext) runValidation(v any) error {
+	if va, ok := v.(Validatable); ok {
+		if err := va.Validate(); err != nil {
+			return err
+		}
+	}
+	if b.validator != nil {
+		return b.validator(v)
+	}
+	return nil
 }
 
 func MakeBaseContext(writer http.ResponseWriter, request *http.Request) *BaseContext {
@@ -113,7 +141,44 @@ func (b *BaseContext) BindJson(v any) error {
 	if err := json.NewDecoder(b.R.Body).Decode(v); err != nil {
 		return fmt.Errorf("bind json error: %w", err)
 	}
-	return nil
+	return b.runValidation(v)
+}
+
+// BindQuery decodes URL query parameters into v using `schema` struct tags.
+func (b *BaseContext) BindQuery(v any) error {
+	if err := formDecoder.Decode(v, b.R.URL.Query()); err != nil {
+		return fmt.Errorf("bind query error: %w", err)
+	}
+	return b.runValidation(v)
+}
+
+// FormFile returns the first uploaded file for the given field name.
+// Must be called after BindForm (or after manually calling r.ParseMultipartForm).
+func (b *BaseContext) FormFile(key string) (multipart.File, *multipart.FileHeader, error) {
+	return b.R.FormFile(key)
+}
+
+// FormFiles returns all uploaded files for the given field name.
+func (b *BaseContext) FormFiles(key string) ([]*multipart.FileHeader, error) {
+	if b.R.MultipartForm == nil {
+		return nil, fmt.Errorf("multipart form not parsed")
+	}
+	return b.R.MultipartForm.File[key], nil
+}
+
+// BindForm decodes form body (application/x-www-form-urlencoded or multipart/form-data)
+// into v using `schema` struct tags. For multipart/form-data, use a 32 MB default memory limit.
+func (b *BaseContext) BindForm(v any) error {
+	if err := b.R.ParseMultipartForm(32 << 20); err != nil {
+		// Fall back to regular form parse (handles application/x-www-form-urlencoded)
+		if err := b.R.ParseForm(); err != nil {
+			return fmt.Errorf("bind form error: %w", err)
+		}
+	}
+	if err := formDecoder.Decode(v, b.R.Form); err != nil {
+		return fmt.Errorf("bind form error: %w", err)
+	}
+	return b.runValidation(v)
 }
 
 func (b *BaseContext) Json(status int, v any) error {

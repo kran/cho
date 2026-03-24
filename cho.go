@@ -55,6 +55,12 @@ type Cho[T Context] struct {
 	prefix       string
 	ErrorHandler ErrorHandler[T]
 	NotFound     Handler[T]
+	Validator    func(any) error
+}
+
+// validatorSetter is implemented by BaseContext to receive the app validator.
+type validatorSetter interface {
+	setValidator(func(any) error)
 }
 
 // New creates a new Cho instance with the given context maker.
@@ -144,6 +150,11 @@ func (c *Cho[T]) Handle(method, path string, handler Handler[T]) {
 	adapter := func(w http.ResponseWriter, r *http.Request) {
 		gw := &guardWriter{ResponseWriter: w}
 		ctx := c.contextMaker(gw, r)
+		if c.Validator != nil {
+			if vs, ok := any(ctx).(validatorSetter); ok {
+				vs.setValidator(c.Validator)
+			}
+		}
 
 		// Build middleware chain at request time
 		chain := handler
