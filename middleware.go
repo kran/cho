@@ -1,10 +1,15 @@
 package cho
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"strconv"
+	"sync"
 	"time"
 )
 
@@ -137,6 +142,101 @@ func RequestID[T Context]() Middleware[T] {
 	}
 }
 
+// Timeout returns a middleware that cancels the request context after d.
+// Handlers should respect ctx.Req().Context().Done() for early exit.
+func Timeout[T Context](d time.Duration) Middleware[T] {
+	return func(ctx T, next Handler[T]) error {
+		reqCtx, cancel := context.WithTimeout(ctx.Req().Context(), d)
+		defer cancel()
+		if rs, ok := any(ctx).(interface{ SetReq(*http.Request) }); ok {
+			rs.SetReq(ctx.Req().WithContext(reqCtx))
+		}
+		return next(ctx)
+	}
+}
+
+// RateLimit returns a middleware that limits requests using a token bucket algorithm.
+// rps is the refill rate (requests per second), burst is the max tokens (allows short bursts).
+// An optional keyFunc extracts the rate limit key from the context; defaults to client IP.
+func RateLimit[T Context](rps float64, burst int, keyFunc ...func(T) string) Middleware[T] {
+	rl := &rateLimiter{
+		visitors: make(map[string]*visitor),
+		rps:      rps,
+		burst:    float64(burst),
+	}
+	go rl.cleanup(3 * time.Minute)
+
+	var getKey func(T) string
+	if len(keyFunc) > 0 && keyFunc[0] != nil {
+		getKey = keyFunc[0]
+	} else {
+		getKey = func(ctx T) string {
+			host, _, _ := net.SplitHostPort(ctx.Req().RemoteAddr)
+			return host
+		}
+	}
+
+	return func(ctx T, next Handler[T]) error {
+		if !rl.allow(getKey(ctx)) {
+			retryAfter := 1.0 / rps
+			ctx.Res().Header().Set("Retry-After", strconv.Itoa(max(1, int(retryAfter))))
+			return NewHTTPError(http.StatusTooManyRequests, fmt.Sprintf("rate limit exceeded, try again in %.0fs", retryAfter))
+		}
+		return next(ctx)
+	}
+}
+
+type visitor struct {
+	tokens   float64
+	lastSeen time.Time
+}
+
+type rateLimiter struct {
+	mu       sync.Mutex
+	visitors map[string]*visitor
+	rps      float64
+	burst    float64
+}
+
+func (rl *rateLimiter) allow(key string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	v, exists := rl.visitors[key]
+	if !exists {
+		rl.visitors[key] = &visitor{tokens: rl.burst - 1, lastSeen: now}
+		return true
+	}
+
+	// Refill tokens based on elapsed time
+	v.tokens += now.Sub(v.lastSeen).Seconds() * rl.rps
+	if v.tokens > rl.burst {
+		v.tokens = rl.burst
+	}
+	v.lastSeen = now
+
+	if v.tokens < 1 {
+		return false
+	}
+	v.tokens--
+	return true
+}
+
+func (rl *rateLimiter) cleanup(maxAge time.Duration) {
+	for {
+		time.Sleep(time.Minute)
+		rl.mu.Lock()
+		now := time.Now()
+		for k, v := range rl.visitors {
+			if now.Sub(v.lastSeen) > maxAge {
+				delete(rl.visitors, k)
+			}
+		}
+		rl.mu.Unlock()
+	}
+}
+
 func generateID() string {
 	b := make([]byte, 8)
 	rand.Read(b)
@@ -146,4 +246,9 @@ func generateID() string {
 // SetRes allows middleware to swap the underlying response writer (e.g. for status capture).
 func (b *BaseContext) SetRes(w http.ResponseWriter) {
 	b.W = w
+}
+
+// SetReq allows middleware to swap the underlying request (e.g. for context propagation).
+func (b *BaseContext) SetReq(r *http.Request) {
+	b.R = r
 }

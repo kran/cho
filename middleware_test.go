@@ -124,14 +124,12 @@ func TestCORSSpecificOrigin(t *testing.T) {
 func TestCORSPreflight(t *testing.T) {
 	app := newTestApp()
 	app.Use(CORS[*testCtx]())
-	// Register both GET and OPTIONS for the route (CORS preflight needs OPTIONS handler)
 	app.Get("/api", func(ctx *testCtx) error {
 		return ctx.String(200, "ok")
 	})
-	app.Handle(http.MethodOptions, "/api", func(ctx *testCtx) error {
-		return ctx.String(200, "ok")
-	})
 
+	// OPTIONS request should be handled by CORS middleware automatically,
+	// without needing an explicit OPTIONS handler.
 	r := newReqWithOrigin("OPTIONS", "/api", "http://example.com")
 	r.Header.Set("Access-Control-Request-Headers", "Content-Type, Authorization")
 	w := sendReq(app, r)
@@ -222,6 +220,65 @@ func TestRequestIDUnique(t *testing.T) {
 	id2 := w2.Header().Get("X-Request-ID")
 	if id1 == id2 {
 		t.Errorf("request IDs should be unique, got %q twice", id1)
+	}
+}
+
+func TestRateLimit(t *testing.T) {
+	app := newTestApp()
+	app.Use(RateLimit[*testCtx](100, 3)) // 100 rps, burst 3
+	app.Get("/", func(ctx *testCtx) error {
+		return ctx.String(200, "ok")
+	})
+
+	// First 3 requests should succeed (burst)
+	for i := 0; i < 3; i++ {
+		w := app.Test("GET", "/", nil)
+		if w.Code != 200 {
+			t.Errorf("request %d: status = %d, want 200", i+1, w.Code)
+		}
+	}
+
+	// 4th request should be rate limited
+	w := app.Test("GET", "/", nil)
+	if w.Code != 429 {
+		t.Errorf("request 4: status = %d, want 429", w.Code)
+	}
+	if w.Header().Get("Retry-After") == "" {
+		t.Error("missing Retry-After header")
+	}
+}
+
+func TestRateLimitCustomKey(t *testing.T) {
+	app := newTestApp()
+	// Rate limit by custom header, burst 1
+	app.Use(RateLimit[*testCtx](1, 1, func(ctx *testCtx) string {
+		return ctx.Req().Header.Get("X-API-Key")
+	}))
+	app.Get("/", func(ctx *testCtx) error {
+		return ctx.String(200, "ok")
+	})
+
+	// Different keys should have independent limits
+	r1 := httptest.NewRequest("GET", "/", nil)
+	r1.Header.Set("X-API-Key", "key-a")
+	w1 := sendReq(app, r1)
+	if w1.Code != 200 {
+		t.Errorf("key-a first request: status = %d, want 200", w1.Code)
+	}
+
+	r2 := httptest.NewRequest("GET", "/", nil)
+	r2.Header.Set("X-API-Key", "key-b")
+	w2 := sendReq(app, r2)
+	if w2.Code != 200 {
+		t.Errorf("key-b first request: status = %d, want 200", w2.Code)
+	}
+
+	// key-a should be limited now
+	r3 := httptest.NewRequest("GET", "/", nil)
+	r3.Header.Set("X-API-Key", "key-a")
+	w3 := sendReq(app, r3)
+	if w3.Code != 429 {
+		t.Errorf("key-a second request: status = %d, want 429", w3.Code)
 	}
 }
 

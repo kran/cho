@@ -2,7 +2,7 @@
 
 Generic typed HTTP framework for Go 1.22+. Thin wrapper over `net/http.ServeMux`.
 
-Zero external dependencies. ~600 lines of code across 4 files.
+~800 lines of code across 4 files. One dependency ([gorilla/schema](https://github.com/gorilla/schema) for form binding).
 
 ## Install
 
@@ -80,6 +80,8 @@ app.Use(func(ctx *AppContext, next cho.Handler[*AppContext]) error {
 
 Returning without calling `next` short-circuits the chain.
 
+Handler errors are converted to HTTP responses at the innermost level (before middleware "after" code runs), so middleware like Logger can observe the correct response status. The error is still propagated for middleware inspection.
+
 ### Groups
 
 ```go
@@ -89,7 +91,7 @@ app.Group("/api", func(g *cho.Cho[*AppContext]) {
 })
 ```
 
-Groups inherit parent middleware at creation time. Middleware added to a group does not affect the parent or other groups.
+Groups inherit parent middleware, error handler, and validator at creation time. Middleware added to a group does not affect the parent or other groups.
 
 ### Controller Mount
 
@@ -145,6 +147,13 @@ app.NotFound = func(ctx *AppContext) error {
 // Start in background, get *http.Server back
 srv, err := app.Start(8080)
 
+// With custom server configuration
+srv, err := app.Start(8080, &http.Server{
+    ReadTimeout:  30 * time.Second,
+    WriteTimeout: 30 * time.Second,
+    IdleTimeout:  120 * time.Second,
+})
+
 // Start and block until signal, then graceful shutdown (10s timeout)
 err := app.Run(8080)
 
@@ -180,7 +189,16 @@ Request:
 | `Method` | `() string` | HTTP method |
 | `Path` | `() string` | URL path |
 | `RemoteIP` | `() string` | Client IP (checks X-Forwarded-For, X-Real-IP, RemoteAddr) |
-| `BindJson` | `(v any) error` | Decode JSON body into v |
+
+Binding:
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `BindJson` | `(v any) error` | Decode JSON body (`json` tags) |
+| `BindQuery` | `(v any) error` | Decode URL query parameters (`schema` tags) |
+| `BindForm` | `(v any) error` | Decode form body: url-encoded or multipart (`schema` tags) |
+| `FormFile` | `(key) (multipart.File, *multipart.FileHeader, error)` | Single uploaded file |
+| `FormFiles` | `(key) ([]*multipart.FileHeader, error)` | Multiple uploaded files |
 
 Response:
 
@@ -197,6 +215,43 @@ Response:
 | `ServeFile` | `(filepath)` | Serve static file |
 | `SSE` | `(fn, keepAlive...)` | Server-Sent Events stream |
 
+## Validation
+
+Two mechanisms, usable independently or together:
+
+**Pluggable Validator** — set once, applies to all Bind methods:
+
+```go
+import "github.com/go-playground/validator/v10"
+
+var validate = validator.New()
+app.Validator = func(v any) error {
+    return validate.Struct(v)
+}
+
+type LoginReq struct {
+    Email    string `json:"email"    validate:"required,email"`
+    Password string `json:"password" validate:"required,min=8"`
+}
+```
+
+**Validatable interface** — per-struct custom logic, called automatically after binding:
+
+```go
+type CreateOrderReq struct {
+    Items []int `json:"items"`
+}
+
+func (r *CreateOrderReq) Validate() error {
+    if len(r.Items) == 0 {
+        return cho.NewHTTPError(400, "at least one item required")
+    }
+    return nil
+}
+```
+
+When both are present, `Validate()` runs first, then the pluggable validator.
+
 ## Built-in Middleware
 
 ```go
@@ -205,6 +260,36 @@ cho.MaxBodySize[T](bytes)           // Limit request body size
 cho.CORS[T](origins...)             // CORS headers + preflight handling
 cho.Logger[T](prefix...)            // Log method, path, status, duration
 cho.RequestID[T]()                  // X-Request-ID header (generate or preserve)
+cho.Timeout[T](duration)            // Cancel request context after duration
+```
+
+CORS preflight (OPTIONS) is handled automatically — no need to register explicit OPTIONS routes.
+
+## WebSocket
+
+cho supports WebSocket via HTTP Hijack. Use any WebSocket library:
+
+```go
+import "github.com/gorilla/websocket"
+
+var upgrader = websocket.Upgrader{}
+
+app.Get("/ws", func(ctx *AppContext) error {
+    conn, err := upgrader.Upgrade(ctx.Res(), ctx.Req(), nil)
+    if err != nil {
+        return err
+    }
+    defer conn.Close()
+
+    for {
+        mt, msg, err := conn.ReadMessage()
+        if err != nil {
+            break
+        }
+        conn.WriteMessage(mt, msg)
+    }
+    return nil
+})
 ```
 
 ## RPC
@@ -235,19 +320,20 @@ Methods with `context.Context` as first parameter receive the request context. I
 
 ## Internals
 
-- `guardWriter` wraps `http.ResponseWriter` to prevent double `WriteHeader` calls
-- `Cho` implements `http.Handler` — `ServeHTTP` intercepts for custom `NotFound`
+- `guardWriter` wraps `http.ResponseWriter` to prevent double `WriteHeader` calls and supports `Hijack` for WebSocket
+- `Cho` implements `http.Handler` — `ServeHTTP` intercepts for custom `NotFound` and CORS preflight
+- Handler errors are converted to HTTP responses inside the middleware chain, then propagated for middleware inspection
 - Middleware chain is built per-request from the current `middlewares` slice
 - `Mount` uses reflection; method matching is by name prefix + parameter/return type
-- `Start` uses `net.Listen` then `srv.Serve` in a goroutine
+- `Start` accepts an optional `*http.Server` for custom timeouts/TLS configuration
 - `Run` adds signal handling and `srv.Shutdown` on top of `Start`
 
 ## File Structure
 
 ```
 cho.go          Router, middleware chain, error handling, Mount, guardWriter, helpers
-context.go      Context interface, BaseContext, request/response methods, SSE
-middleware.go   Recovery, MaxBodySize, CORS, Logger, RequestID
+context.go      Context interface, BaseContext, request/response methods, binding, SSE
+middleware.go   Recovery, MaxBodySize, CORS, Logger, RequestID, Timeout
 rpc.go          MountRpc, MakeRpcClient
 ```
 

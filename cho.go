@@ -1,6 +1,7 @@
 package cho
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -49,18 +50,50 @@ func NewHTTPError(code int, msg ...string) *HTTPError {
 
 // Cho is a generic HTTP framework built on top of Go's standard net/http.
 type Cho[T Context] struct {
-	mux          *http.ServeMux
-	contextMaker ContextMaker[T]
-	middlewares  []Middleware[T]
-	prefix       string
-	ErrorHandler ErrorHandler[T]
-	NotFound     Handler[T]
-	Validator    func(any) error
+	mux            *http.ServeMux
+	contextMaker   ContextMaker[T]
+	middlewares    []Middleware[T]
+	prefix         string
+	ErrorHandler   ErrorHandler[T]
+	NotFound       Handler[T]
+	Validator      func(any) error
+	trustedProxies []*net.IPNet
 }
 
-// validatorSetter is implemented by BaseContext to receive the app validator.
-type validatorSetter interface {
+// SetTrustedProxies configures which proxy IPs/CIDRs are trusted for
+// X-Forwarded-For and X-Real-IP header parsing in RemoteIP().
+// Accepts IPs ("10.0.0.1") or CIDRs ("10.0.0.0/8").
+// When not set, RemoteIP() only returns RemoteAddr (safe default).
+func (c *Cho[T]) SetTrustedProxies(cidrs []string) error {
+	nets := make([]*net.IPNet, 0, len(cidrs))
+	for _, s := range cidrs {
+		if !strings.Contains(s, "/") {
+			ip := net.ParseIP(s)
+			if ip == nil {
+				return fmt.Errorf("cho: invalid trusted proxy IP: %s", s)
+			}
+			bits := 32
+			if ip.To4() == nil {
+				bits = 128
+			}
+			_, cidr, _ := net.ParseCIDR(fmt.Sprintf("%s/%d", s, bits))
+			nets = append(nets, cidr)
+		} else {
+			_, cidr, err := net.ParseCIDR(s)
+			if err != nil {
+				return fmt.Errorf("cho: invalid trusted proxy CIDR: %s", s)
+			}
+			nets = append(nets, cidr)
+		}
+	}
+	c.trustedProxies = nets
+	return nil
+}
+
+// contextConfigurer is implemented by BaseContext to receive app-level config.
+type contextConfigurer interface {
 	setValidator(func(any) error)
+	setTrustedProxies([]*net.IPNet)
 }
 
 // New creates a new Cho instance with the given context maker.
@@ -73,6 +106,24 @@ func New[T Context](em ContextMaker[T]) *Cho[T] {
 
 // ServeHTTP implements http.Handler.
 func (c *Cho[T]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Run middleware chain for OPTIONS requests without an explicit handler
+	// to support CORS preflight.
+	if r.Method == http.MethodOptions {
+		_, pattern := c.mux.Handler(r)
+		if pattern == "" && len(c.middlewares) > 0 {
+			gw := &guardWriter{ResponseWriter: w}
+			ctx := c.contextMaker(gw, r)
+			noop := Handler[T](func(ctx T) error { return nil })
+			chain := c.buildChain(noop)
+			if err := chain(ctx); err != nil {
+				c.handleError(ctx, err)
+			}
+			if gw.committed {
+				return
+			}
+		}
+	}
+
 	if c.NotFound != nil {
 		_, pattern := c.mux.Handler(r)
 		if pattern == "" {
@@ -88,14 +139,17 @@ func (c *Cho[T]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // Start binds to the given port and begins serving HTTP requests in the background.
-func (c *Cho[T]) Start(port int) (*http.Server, error) {
-	srv := &http.Server{
-		Addr:         fmt.Sprintf(":%d", port),
-		Handler:      c,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+// An optional *http.Server can be passed to configure timeouts, TLS, etc.
+// The server's Addr and Handler are always overwritten.
+func (c *Cho[T]) Start(port int, server ...*http.Server) (*http.Server, error) {
+	var srv *http.Server
+	if len(server) > 0 && server[0] != nil {
+		srv = server[0]
+	} else {
+		srv = &http.Server{}
 	}
+	srv.Addr = fmt.Sprintf(":%d", port)
+	srv.Handler = c
 	ln, err := net.Listen("tcp", srv.Addr)
 	if err != nil {
 		return nil, err
@@ -106,8 +160,8 @@ func (c *Cho[T]) Start(port int) (*http.Server, error) {
 }
 
 // Run starts the server and blocks until SIGINT/SIGTERM, then shuts down gracefully.
-func (c *Cho[T]) Run(port int) error {
-	srv, err := c.Start(port)
+func (c *Cho[T]) Run(port int, server ...*http.Server) error {
+	srv, err := c.Start(port, server...)
 	if err != nil {
 		return err
 	}
@@ -132,11 +186,13 @@ func (c *Cho[T]) Use(mws ...Middleware[T]) {
 // Group creates a route group with prefix and middleware inheritance.
 func (c *Cho[T]) Group(prefix string, fn func(g *Cho[T])) {
 	sub := &Cho[T]{
-		mux:          c.mux,
-		contextMaker: c.contextMaker,
-		middlewares:  append([]Middleware[T]{}, c.middlewares...),
-		prefix:       normalizePath(c.prefix + prefix),
-		ErrorHandler: c.ErrorHandler,
+		mux:            c.mux,
+		contextMaker:   c.contextMaker,
+		middlewares:    append([]Middleware[T]{}, c.middlewares...),
+		prefix:         normalizePath(c.prefix + prefix),
+		ErrorHandler:   c.ErrorHandler,
+		Validator:      c.Validator,
+		trustedProxies: c.trustedProxies,
 	}
 	fn(sub)
 }
@@ -144,30 +200,43 @@ func (c *Cho[T]) Group(prefix string, fn func(g *Cho[T])) {
 // Handle registers a route with the given HTTP method and path.
 // Middleware chain is built at request time, so middlewares added after
 // route registration still apply.
-func (c *Cho[T]) Handle(method, path string, handler Handler[T]) {
+func (c *Cho[T]) Handle(method, path string, handler Handler[T], mws ...Middleware[T]) {
 	fullPath := normalizePath(c.prefix + path)
 
 	adapter := func(w http.ResponseWriter, r *http.Request) {
 		gw := &guardWriter{ResponseWriter: w}
 		ctx := c.contextMaker(gw, r)
-		if c.Validator != nil {
-			if vs, ok := any(ctx).(validatorSetter); ok {
-				vs.setValidator(c.Validator)
+		if cc, ok := any(ctx).(contextConfigurer); ok {
+			if c.Validator != nil {
+				cc.setValidator(c.Validator)
+			}
+			if c.trustedProxies != nil {
+				cc.setTrustedProxies(c.trustedProxies)
 			}
 		}
 
-		// Build middleware chain at request time
-		chain := handler
-		mws := c.middlewares
+		// Wrap handler: convert errors to HTTP responses at the innermost level
+		// so middleware "after" code can observe the correct response status.
+		// The original error is still returned for middleware inspection.
+		wrapped := Handler[T](func(ctx T) error {
+			err := handler(ctx)
+			if err != nil {
+				c.handleError(ctx, err)
+			}
+			return err
+		})
+
+		// Apply per-route middleware (innermost, closest to handler)
 		for i := len(mws) - 1; i >= 0; i-- {
 			mw := mws[i]
-			next := chain
-			chain = func(ctx T) error {
+			next := wrapped
+			wrapped = func(ctx T) error {
 				return mw(ctx, next)
 			}
 		}
 
-		if err := chain(ctx); err != nil {
+		chain := c.buildChain(wrapped)
+		if err := chain(ctx); err != nil && !gw.committed {
 			c.handleError(ctx, err)
 		}
 	}
@@ -175,10 +244,33 @@ func (c *Cho[T]) Handle(method, path string, handler Handler[T]) {
 	c.mux.HandleFunc(fmt.Sprintf("%s %s", method, fullPath), adapter)
 }
 
-func (c *Cho[T]) Get(path string, h Handler[T])    { c.Handle(http.MethodGet, path, h) }
-func (c *Cho[T]) Post(path string, h Handler[T])   { c.Handle(http.MethodPost, path, h) }
-func (c *Cho[T]) Put(path string, h Handler[T])    { c.Handle(http.MethodPut, path, h) }
-func (c *Cho[T]) Delete(path string, h Handler[T]) { c.Handle(http.MethodDelete, path, h) }
+// buildChain wraps handler with the current middleware stack.
+// Chain is built at call time so middlewares added after route registration apply.
+func (c *Cho[T]) buildChain(handler Handler[T]) Handler[T] {
+	chain := handler
+	mws := c.middlewares
+	for i := len(mws) - 1; i >= 0; i-- {
+		mw := mws[i]
+		next := chain
+		chain = func(ctx T) error {
+			return mw(ctx, next)
+		}
+	}
+	return chain
+}
+
+func (c *Cho[T]) Get(path string, h Handler[T], mws ...Middleware[T]) {
+	c.Handle(http.MethodGet, path, h, mws...)
+}
+func (c *Cho[T]) Post(path string, h Handler[T], mws ...Middleware[T]) {
+	c.Handle(http.MethodPost, path, h, mws...)
+}
+func (c *Cho[T]) Put(path string, h Handler[T], mws ...Middleware[T]) {
+	c.Handle(http.MethodPut, path, h, mws...)
+}
+func (c *Cho[T]) Delete(path string, h Handler[T], mws ...Middleware[T]) {
+	c.Handle(http.MethodDelete, path, h, mws...)
+}
 
 // Mount auto-mounts exported methods of ctrl as HTTP handlers.
 // Method naming: GetUserInfo -> GET /user-info, PostLogin -> POST /login.
@@ -268,6 +360,13 @@ func (w *guardWriter) Flush() {
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+func (w *guardWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, fmt.Errorf("underlying ResponseWriter does not support hijacking")
 }
 
 func (w *guardWriter) Unwrap() http.ResponseWriter {

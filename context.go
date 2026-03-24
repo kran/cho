@@ -31,13 +31,31 @@ type Validatable interface {
 // BaseContext is the default Context implementation. Embed it in your own context struct
 // to satisfy the Context interface and gain helper methods.
 type BaseContext struct {
-	W         http.ResponseWriter
-	R         *http.Request
-	validator func(any) error
+	W              http.ResponseWriter
+	R              *http.Request
+	validator      func(any) error
+	trustedProxies []*net.IPNet
 }
 
 func (b *BaseContext) setValidator(fn func(any) error) {
 	b.validator = fn
+}
+
+func (b *BaseContext) setTrustedProxies(nets []*net.IPNet) {
+	b.trustedProxies = nets
+}
+
+func (b *BaseContext) isTrusted(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	for _, n := range b.trustedProxies {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *BaseContext) runValidation(v any) error {
@@ -91,18 +109,39 @@ func (b *BaseContext) SetCookie(cookie *http.Cookie) {
 	http.SetCookie(b.W, cookie)
 }
 
-// RemoteIP returns the client IP, checking X-Forwarded-For and X-Real-IP first.
+// RemoteIP returns the client IP address.
+// If TrustedProxies is configured and the direct peer is trusted,
+// it walks X-Forwarded-For from right to left, returning the first
+// untrusted IP. Otherwise it returns RemoteAddr directly (safe default).
 func (b *BaseContext) RemoteIP() string {
-	if ip := b.R.Header.Get("X-Forwarded-For"); ip != "" {
-		if i := strings.IndexByte(ip, ','); i > 0 {
-			return strings.TrimSpace(ip[:i])
-		}
-		return ip
-	}
-	if ip := b.R.Header.Get("X-Real-IP"); ip != "" {
-		return ip
-	}
 	host, _, _ := net.SplitHostPort(b.R.RemoteAddr)
+
+	// No trusted proxies configured — safe default, ignore headers
+	if len(b.trustedProxies) == 0 {
+		return host
+	}
+
+	// Direct peer not trusted — return RemoteAddr
+	if !b.isTrusted(host) {
+		return host
+	}
+
+	// Check X-Forwarded-For: walk from right to left, skip trusted IPs
+	if xff := b.R.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		for i := len(parts) - 1; i >= 0; i-- {
+			ip := strings.TrimSpace(parts[i])
+			if !b.isTrusted(ip) {
+				return ip
+			}
+		}
+	}
+
+	// Check X-Real-IP
+	if xri := b.R.Header.Get("X-Real-IP"); xri != "" {
+		return xri
+	}
+
 	return host
 }
 
@@ -169,8 +208,12 @@ func (b *BaseContext) FormFiles(key string) ([]*multipart.FileHeader, error) {
 // BindForm decodes form body (application/x-www-form-urlencoded or multipart/form-data)
 // into v using `schema` struct tags. For multipart/form-data, use a 32 MB default memory limit.
 func (b *BaseContext) BindForm(v any) error {
-	if err := b.R.ParseMultipartForm(32 << 20); err != nil {
-		// Fall back to regular form parse (handles application/x-www-form-urlencoded)
+	ct := b.R.Header.Get("Content-Type")
+	if strings.HasPrefix(ct, "multipart/") {
+		if err := b.R.ParseMultipartForm(32 << 20); err != nil {
+			return fmt.Errorf("bind form error: %w", err)
+		}
+	} else {
 		if err := b.R.ParseForm(); err != nil {
 			return fmt.Errorf("bind form error: %w", err)
 		}

@@ -2,6 +2,7 @@ package cho
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -55,18 +56,34 @@ func TestHeaderAndSetHeader(t *testing.T) {
 	}
 }
 
-func TestRemoteIP(t *testing.T) {
+func TestRemoteIPSafeDefault(t *testing.T) {
+	// Without trusted proxies, headers are ignored
+	ctx, _ := makeCtx("GET", "/", "")
+	ctx.R.Header.Set("X-Forwarded-For", "1.2.3.4")
+	ctx.R.RemoteAddr = "9.9.9.9:1234"
+	if got := ctx.RemoteIP(); got != "9.9.9.9" {
+		t.Errorf("RemoteIP() = %q, want %q (should ignore X-Forwarded-For)", got, "9.9.9.9")
+	}
+}
+
+func TestRemoteIPTrustedProxy(t *testing.T) {
+	_, trusted, _ := net.ParseCIDR("10.0.0.0/8")
+	_, proxy2, _ := net.ParseCIDR("9.9.9.9/32")
+
 	tests := []struct {
 		name, xff, xri, remoteAddr, want string
 	}{
-		{"X-Forwarded-For single", "1.2.3.4", "", "9.9.9.9:1234", "1.2.3.4"},
-		{"X-Forwarded-For multiple", "1.2.3.4, 5.6.7.8", "", "9.9.9.9:1234", "1.2.3.4"},
-		{"X-Real-IP", "", "2.3.4.5", "9.9.9.9:1234", "2.3.4.5"},
-		{"RemoteAddr fallback", "", "", "10.0.0.1:5678", "10.0.0.1"},
+		{"XFF single hop", "1.2.3.4", "", "10.0.0.1:1234", "1.2.3.4"},
+		{"XFF multi hop, skip trusted", "1.2.3.4, 10.0.0.2", "", "10.0.0.1:1234", "1.2.3.4"},
+		{"XFF spoofed + real", "spoofed, 5.6.7.8, 10.0.0.2", "", "10.0.0.1:1234", "5.6.7.8"},
+		{"X-Real-IP fallback", "", "2.3.4.5", "10.0.0.1:1234", "2.3.4.5"},
+		{"Untrusted peer ignores headers", "1.2.3.4", "", "99.99.99.99:1234", "99.99.99.99"},
+		{"RemoteAddr only", "", "", "10.0.0.1:5678", "10.0.0.1"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx, _ := makeCtx("GET", "/", "")
+			ctx.trustedProxies = []*net.IPNet{trusted, proxy2}
 			if tt.xff != "" {
 				ctx.R.Header.Set("X-Forwarded-For", tt.xff)
 			}
