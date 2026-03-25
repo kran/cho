@@ -2,7 +2,7 @@
 
 Generic typed HTTP framework for Go 1.22+. Thin wrapper over `net/http.ServeMux`.
 
-~800 lines of code across 4 files. One dependency ([gorilla/schema](https://github.com/gorilla/schema) for form binding).
+~1200 lines of code across 4 files. One dependency ([gorilla/schema](https://github.com/gorilla/schema) for form binding).
 
 ## Install
 
@@ -59,6 +59,9 @@ app.Post(path, handler)
 app.Put(path, handler)
 app.Delete(path, handler)
 app.Handle(method, path, handler)
+
+// Per-route middleware
+app.Get(path, handler, middleware1, middleware2)
 ```
 
 ### Middleware
@@ -91,7 +94,7 @@ app.Group("/api", func(g *cho.Cho[*AppContext]) {
 })
 ```
 
-Groups inherit parent middleware, error handler, and validator at creation time. Middleware added to a group does not affect the parent or other groups.
+Groups inherit parent middleware and error handler at creation time. Middleware added to a group does not affect the parent or other groups.
 
 ### Controller Mount
 
@@ -149,9 +152,9 @@ srv, err := app.Start(8080)
 
 // With custom server configuration
 srv, err := app.Start(8080, &http.Server{
-    ReadTimeout:  30 * time.Second,
-    WriteTimeout: 30 * time.Second,
-    IdleTimeout:  120 * time.Second,
+    ReadTimeout: 30 * time.Second,
+    IdleTimeout: 120 * time.Second,
+    // Avoid WriteTimeout if using SSE/WebSocket — use per-route Timeout middleware instead
 })
 
 // Start and block until signal, then graceful shutdown (10s timeout)
@@ -188,7 +191,7 @@ Request:
 | `Cookie` | `(name) (*http.Cookie, error)` | Request cookie |
 | `Method` | `() string` | HTTP method |
 | `Path` | `() string` | URL path |
-| `RemoteIP` | `() string` | Client IP (checks X-Forwarded-For, X-Real-IP, RemoteAddr) |
+| `RemoteIP` | `() string` | Client IP (requires `SetTrustedProxies` to read X-Forwarded-For/X-Real-IP) |
 
 Binding:
 
@@ -214,6 +217,15 @@ Response:
 | `Redirect` | `(status, url)` | HTTP redirect |
 | `ServeFile` | `(filepath)` | Serve static file |
 | `SSE` | `(fn, keepAlive...)` | Server-Sent Events stream |
+| `SetRes` | `(http.ResponseWriter)` | Swap response writer (used by middleware) |
+| `SetReq` | `(*http.Request)` | Swap request (used by middleware) |
+
+Configuration:
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `SetValidator` | `(func(any) error)` | Set validation function for Bind methods |
+| `SetTrustedProxies` | `([]*net.IPNet)` | Set trusted proxies for RemoteIP |
 
 ## Validation
 
@@ -255,6 +267,20 @@ func (r *CreateOrderReq) Validate() error {
 
 When both are present, `Validate()` runs first, then the pluggable validator.
 
+**Trusted Proxies** — configure in ContextMaker for accurate `RemoteIP()`:
+
+```go
+proxies, _ := cho.ParseTrustedProxies([]string{"10.0.0.0/8", "172.16.0.0/12"})
+
+app := cho.New(func(w http.ResponseWriter, r *http.Request) *AppContext {
+    ctx := &AppContext{BaseContext: *cho.MakeBaseContext(w, r)}
+    ctx.SetTrustedProxies(proxies)
+    return ctx
+})
+```
+
+Without trusted proxies, `RemoteIP()` returns `RemoteAddr` directly (safe default, ignores headers).
+
 ## Built-in Middleware
 
 ```go
@@ -264,6 +290,7 @@ cho.CORS[T](origins...)             // CORS headers + preflight handling
 cho.Logger[T](prefix...)            // Log method, path, status, duration
 cho.RequestID[T]()                  // X-Request-ID header (generate or preserve)
 cho.Timeout[T](duration)            // Cancel request context after duration
+cho.RateLimit[T](rps, burst, key?) // Token bucket rate limiting by IP or custom key
 ```
 
 CORS preflight (OPTIONS) is handled automatically — no need to register explicit OPTIONS routes.
@@ -275,7 +302,9 @@ cho supports WebSocket via HTTP Hijack. Use any WebSocket library:
 ```go
 import "github.com/gorilla/websocket"
 
-var upgrader = websocket.Upgrader{}
+var upgrader = websocket.Upgrader{
+    CheckOrigin: func(r *http.Request) bool { return true },
+}
 
 app.Get("/ws", func(ctx *AppContext) error {
     conn, err := upgrader.Upgrade(ctx.Res(), ctx.Req(), nil)
@@ -289,11 +318,50 @@ app.Get("/ws", func(ctx *AppContext) error {
         if err != nil {
             break
         }
-        conn.WriteMessage(mt, msg)
+        conn.WriteMessage(mt, msg) // echo server
     }
     return nil
 })
 ```
+
+> **Note:** Do not set `ReadTimeout` or `WriteTimeout` on `http.Server` when using WebSocket — both will kill long-lived connections. Use per-route `Timeout` middleware for normal API routes instead.
+
+## SSE Stream Proxy
+
+Forward an upstream SSE stream (e.g. OpenAI chat completions) to the client:
+
+```go
+app.Post("/chat", func(ctx *AppContext) error {
+    req, _ := http.NewRequestWithContext(ctx.Req().Context(),
+        "POST", "https://api.openai.com/v1/chat/completions", buildBody())
+    req.Header.Set("Authorization", "Bearer "+apiKey)
+    req.Header.Set("Content-Type", "application/json")
+
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil {
+        return err
+    }
+    defer resp.Body.Close()
+
+    ctx.SSE(func(send func(event, data string)) {
+        scanner := bufio.NewScanner(resp.Body)
+        for scanner.Scan() {
+            line := scanner.Text()
+            if strings.HasPrefix(line, "data: ") {
+                data := strings.TrimPrefix(line, "data: ")
+                if data == "[DONE]" {
+                    send("", "[DONE]")
+                    return
+                }
+                send("", data)
+            }
+        }
+    })
+    return nil
+})
+```
+
+The upstream response is forwarded chunk-by-chunk — no buffering. Client disconnection cancels the upstream request via context propagation.
 
 ## RPC
 
@@ -336,14 +404,14 @@ Methods with `context.Context` as first parameter receive the request context. I
 ```
 cho.go          Router, middleware chain, error handling, Mount, guardWriter, helpers
 context.go      Context interface, BaseContext, request/response methods, binding, SSE
-middleware.go   Recovery, MaxBodySize, CORS, Logger, RequestID, Timeout
+middleware.go   Recovery, MaxBodySize, CORS, Logger, RequestID, Timeout, RateLimit
 rpc.go          MountRpc, MakeRpcClient
 ```
 
 ## Tests
 
 ```
-go test ./...           # 60 tests
+go test ./...           # 67 tests
 go test -race ./...     # with race detector
 go test -v ./...        # verbose
 ```

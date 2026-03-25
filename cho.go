@@ -58,6 +58,33 @@ type Cho[T Context] struct {
 	NotFound     Handler[T]
 }
 
+// ParseTrustedProxies parses a list of IPs ("10.0.0.1") or CIDRs ("10.0.0.0/8")
+// into []*net.IPNet for use with BaseContext.SetTrustedProxies.
+func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
+	nets := make([]*net.IPNet, 0, len(cidrs))
+	for _, s := range cidrs {
+		if !strings.Contains(s, "/") {
+			ip := net.ParseIP(s)
+			if ip == nil {
+				return nil, fmt.Errorf("cho: invalid trusted proxy IP: %s", s)
+			}
+			bits := 32
+			if ip.To4() == nil {
+				bits = 128
+			}
+			_, cidr, _ := net.ParseCIDR(fmt.Sprintf("%s/%d", s, bits))
+			nets = append(nets, cidr)
+		} else {
+			_, cidr, err := net.ParseCIDR(s)
+			if err != nil {
+				return nil, fmt.Errorf("cho: invalid trusted proxy CIDR: %s", s)
+			}
+			nets = append(nets, cidr)
+		}
+	}
+	return nets, nil
+}
+
 // New creates a new Cho instance with the given context maker.
 func New[T Context](em ContextMaker[T]) *Cho[T] {
 	return &Cho[T]{
