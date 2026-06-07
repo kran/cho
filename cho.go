@@ -118,7 +118,20 @@ func (c *Cho[T]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if pattern == "" {
 			gw := &guardWriter{ResponseWriter: w}
 			ctx := c.contextMaker(gw, r)
-			if err := c.NotFound(ctx); err != nil {
+
+			// Wrap NotFound in the middleware chain, same as Handle does for
+			// registered routes. This ensures global middlewares (auth, i18n,
+			// language detection, etc.) apply to unmatched paths.
+			wrapped := Handler[T](func(ctx T) error {
+				err := c.NotFound(ctx)
+				if err != nil {
+					c.handleError(ctx, err)
+				}
+				return err
+			})
+
+			chain := c.buildChain(wrapped)
+			if err := chain(ctx); err != nil && !gw.committed {
 				c.handleError(ctx, err)
 			}
 			return
@@ -379,6 +392,10 @@ func normalizePath(path string) string {
 	if path == "" {
 		return "/"
 	}
+	hasSuffix := strings.HasSuffix(path, "/")
 	path = "/" + strings.Trim(path, "/")
+	if hasSuffix && path != "/" {
+		path += "/" // preserve trailing slash for Go 1.22+ exact-match semantics
+	}
 	return reMultiSlash.ReplaceAllString(path, "/")
 }
