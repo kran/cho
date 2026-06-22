@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path"
 	"reflect"
 	"time"
 )
@@ -44,7 +45,7 @@ func (c *Cho[T]) MountRpc(pathPrefix string, serviceName string, impl any) {
 			continue
 		}
 
-		routePath := normalizePath(fmt.Sprintf("%s/%s/%s", pathPrefix, serviceName, method.Name))
+		routePath := path.Join(pathPrefix, serviceName, method.Name)
 		methodVal := val.Method(i)
 
 		hasCtxParam := mType.NumIn() > 1 && mType.In(1) == goContextType
@@ -54,7 +55,7 @@ func (c *Cho[T]) MountRpc(pathPrefix string, serviceName string, impl any) {
 		}
 		expectedJsonArgs := mType.NumIn() - 1 - jsonArgStart
 
-		handler := func(ctx T) error {
+		handler := func(ctx T) {
 			defer func() {
 				if r := recover(); r != nil {
 					c.replyRpc(ctx.Res(), 500, "internal server error")
@@ -65,21 +66,21 @@ func (c *Cho[T]) MountRpc(pathPrefix string, serviceName string, impl any) {
 			ctx.Req().Body.Close()
 			if err != nil {
 				c.replyRpc(ctx.Res(), 400, "failed to read request body")
-				return nil
+				return
 			}
 
 			var rawArgs []json.RawMessage
 			if len(body) > 0 {
 				if err := json.Unmarshal(body, &rawArgs); err != nil {
 					c.replyRpc(ctx.Res(), 400, "invalid JSON array payload")
-					return nil
+					return
 				}
 			}
 
 			if len(rawArgs) != expectedJsonArgs {
 				c.replyRpc(ctx.Res(), 400, fmt.Sprintf(
 					"expected %d arguments, got %d", expectedJsonArgs, len(rawArgs)))
-				return nil
+				return
 			}
 
 			callArgs := make([]reflect.Value, mType.NumIn()-1)
@@ -91,7 +92,7 @@ func (c *Cho[T]) MountRpc(pathPrefix string, serviceName string, impl any) {
 				argPtr := reflect.New(mType.In(j + 1))
 				if err := json.Unmarshal(rawArgs[j-jsonArgStart], argPtr.Interface()); err != nil {
 					c.replyRpc(ctx.Res(), 400, fmt.Sprintf("argument %d: %v", j-jsonArgStart, err))
-					return nil
+					return
 				}
 				callArgs[j] = argPtr.Elem()
 			}
@@ -101,7 +102,7 @@ func (c *Cho[T]) MountRpc(pathPrefix string, serviceName string, impl any) {
 			errVal := results[len(results)-1]
 			if !errVal.IsNil() {
 				c.replyRpc(ctx.Res(), 500, "internal server error")
-				return nil
+				return
 			}
 
 			numRes := len(results) - 1
@@ -113,7 +114,6 @@ func (c *Cho[T]) MountRpc(pathPrefix string, serviceName string, impl any) {
 			dataBytes, _ := json.Marshal(resList)
 			ctx.Res().Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(ctx.Res()).Encode(rpcEnvelope{Data: dataBytes})
-			return nil
 		}
 
 		c.Handle(http.MethodPost, routePath, handler)

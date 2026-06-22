@@ -169,7 +169,7 @@ func TestRpcClientRoundTrip(t *testing.T) {
 	app := newTestApp()
 	app.MountRpc("/rpc", "math", &MathService{})
 
-	srv, err := app.Start(0)
+	srv, _, err := app.Start(0)
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}

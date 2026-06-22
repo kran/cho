@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"mime/multipart"
-	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -14,7 +13,13 @@ import (
 	"github.com/gorilla/schema"
 )
 
-var formDecoder = schema.NewDecoder()
+var formDecoder = func() *schema.Decoder {
+	d := schema.NewDecoder()
+	// Tolerate extra query/form keys not present in the target struct
+	// (e.g. cache-busting params) instead of failing the whole bind.
+	d.IgnoreUnknownKeys(true)
+	return d
+}()
 
 // Context is the interface that all Cho handler contexts must implement.
 type Context interface {
@@ -31,35 +36,15 @@ type Validatable interface {
 // BaseContext is the default Context implementation. Embed it in your own context struct
 // to satisfy the Context interface and gain helper methods.
 type BaseContext struct {
-	W              http.ResponseWriter
-	R              *http.Request
-	validator      func(any) error
-	trustedProxies []*net.IPNet
+	W         http.ResponseWriter
+	R         *http.Request
+	validator func(any) error
 }
 
 // SetValidator configures a validation function that runs automatically
 // after BindJson, BindQuery, and BindForm.
 func (b *BaseContext) SetValidator(fn func(any) error) {
 	b.validator = fn
-}
-
-// SetTrustedProxies configures which proxy IPs are trusted for
-// X-Forwarded-For and X-Real-IP header parsing in RemoteIP().
-func (b *BaseContext) SetTrustedProxies(nets []*net.IPNet) {
-	b.trustedProxies = nets
-}
-
-func (b *BaseContext) isTrusted(ipStr string) bool {
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		return false
-	}
-	for _, n := range b.trustedProxies {
-		if n.Contains(ip) {
-			return true
-		}
-	}
-	return false
 }
 
 func (b *BaseContext) runValidation(v any) error {
@@ -111,42 +96,6 @@ func (b *BaseContext) Cookie(name string) (*http.Cookie, error) {
 // SetCookie adds a Set-Cookie header to the response.
 func (b *BaseContext) SetCookie(cookie *http.Cookie) {
 	http.SetCookie(b.W, cookie)
-}
-
-// RemoteIP returns the client IP address.
-// If TrustedProxies is configured and the direct peer is trusted,
-// it walks X-Forwarded-For from right to left, returning the first
-// untrusted IP. Otherwise it returns RemoteAddr directly (safe default).
-func (b *BaseContext) RemoteIP() string {
-	host, _, _ := net.SplitHostPort(b.R.RemoteAddr)
-
-	// No trusted proxies configured — safe default, ignore headers
-	if len(b.trustedProxies) == 0 {
-		return host
-	}
-
-	// Direct peer not trusted — return RemoteAddr
-	if !b.isTrusted(host) {
-		return host
-	}
-
-	// Check X-Forwarded-For: walk from right to left, skip trusted IPs
-	if xff := b.R.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		for i := len(parts) - 1; i >= 0; i-- {
-			ip := strings.TrimSpace(parts[i])
-			if !b.isTrusted(ip) {
-				return ip
-			}
-		}
-	}
-
-	// Check X-Real-IP
-	if xri := b.R.Header.Get("X-Real-IP"); xri != "" {
-		return xri
-	}
-
-	return host
 }
 
 // Method returns the HTTP method of the request.
@@ -234,10 +183,13 @@ func (b *BaseContext) Json(status int, v any) error {
 	return json.NewEncoder(b.W).Encode(v)
 }
 
-func (b *BaseContext) String(status int, format string, values ...any) error {
+// String writes plain text verbatim. Any '%' is literal — no format
+// interpretation, so user-supplied content is safe. For formatting, build the
+// string with fmt.Sprintf and pass it here.
+func (b *BaseContext) String(status int, s string) error {
 	b.W.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	b.W.WriteHeader(status)
-	_, err := fmt.Fprintf(b.W, format, values...)
+	_, err := b.W.Write([]byte(s))
 	return err
 }
 
