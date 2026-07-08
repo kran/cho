@@ -367,6 +367,91 @@ func TestMountPanicsOnWrongSignature(t *testing.T) {
 	app.Mount("/bad", &badController{})
 }
 
+// --- UseCtx: typed middleware ---
+
+func TestUseCtxSetsAndReadsFields(t *testing.T) {
+	app := newTestApp()
+	app.UseCtx(func(ctx *testCtx, next http.Handler) {
+		ctx.SetHeader("X-From-Ctx", "set-by-typed-mw")
+		next.ServeHTTP(ctx.W, ctx.R)
+	})
+	app.Get("/", func(ctx *testCtx) { ctx.String(200, "ok") })
+
+	w := app.Test("GET", "/", nil)
+	if w.Header().Get("X-From-Ctx") != "set-by-typed-mw" {
+		t.Error("typed middleware should have access to T")
+	}
+}
+
+func TestUseCtxChainOrder(t *testing.T) {
+	app := newTestApp()
+	var order []string
+
+	app.UseCtx(func(ctx *testCtx, next http.Handler) {
+		order = append(order, "a-before")
+		next.ServeHTTP(ctx.W, ctx.R)
+		order = append(order, "a-after")
+	})
+	app.UseCtx(func(ctx *testCtx, next http.Handler) {
+		order = append(order, "b-before")
+		next.ServeHTTP(ctx.W, ctx.R)
+		order = append(order, "b-after")
+	})
+	app.Get("/", func(ctx *testCtx) {
+		order = append(order, "handler")
+		ctx.String(200, "ok")
+	})
+
+	app.Test("GET", "/", nil)
+	want := "a-before,b-before,handler,b-after,a-after"
+	got := strings.Join(order, ",")
+	if got != want {
+		t.Errorf("order = %q, want %q", got, want)
+	}
+}
+
+func TestUseCtxAndStandardMxMixed(t *testing.T) {
+	app := newTestApp()
+	var order []string
+
+	app.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			order = append(order, "std-before")
+			next.ServeHTTP(w, r)
+			order = append(order, "std-after")
+		})
+	})
+	app.UseCtx(func(ctx *testCtx, next http.Handler) {
+		order = append(order, "typed-before")
+		next.ServeHTTP(ctx.W, ctx.R)
+		order = append(order, "typed-after")
+	})
+	app.Get("/", func(ctx *testCtx) {
+		order = append(order, "handler")
+		ctx.String(200, "ok")
+	})
+
+	app.Test("GET", "/", nil)
+	want := "std-before,typed-before,handler,typed-after,std-after"
+	got := strings.Join(order, ",")
+	if got != want {
+		t.Errorf("order = %q, want %q", got, want)
+	}
+}
+
+func TestUseCtxShortCircuit(t *testing.T) {
+	app := newTestApp()
+	app.UseCtx(func(ctx *testCtx, next http.Handler) {
+		ctx.String(401, "blocked")
+	})
+	app.Get("/", func(ctx *testCtx) { t.Fatal("handler should not be called") })
+
+	w := app.Test("GET", "/", nil)
+	if w.Code != 401 {
+		t.Errorf("status = %d, want 401", w.Code)
+	}
+}
+
 // --- Helpers ---
 
 func TestCamelToKebab(t *testing.T) {

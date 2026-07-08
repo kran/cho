@@ -29,6 +29,11 @@ type Handler[T Context] func(T)
 // middleware are usable as-is — no generics.
 type Middleware = func(http.Handler) http.Handler
 
+// Mw is a typed middleware. ctx carries the request-scoped T (with W and R
+// available via the Context interface). Call next.ServeHTTP(ctx.W, ctx.R) to
+// continue the chain; return without calling next to short-circuit.
+type Mw[T Context] func(ctx T, next http.Handler)
+
 // ContextMaker creates a fresh T from the raw writer/request, once per request.
 type ContextMaker[T Context] func(http.ResponseWriter, *http.Request) T
 
@@ -44,25 +49,65 @@ type Cho[T Context] struct {
 	once sync.Once
 }
 
-// New creates a Cho backed by a fresh chi router.
+// choCtxKey is the key for the typed context in request.Context.
+// Unexported — only accessible through CtxFrom.
+type choCtxKey struct{}
+
+// CtxFrom extracts the typed context T from the request. The context is
+// created by a built-in middleware at position 0 in the chain, so it is
+// available to all subsequent middleware and the handler.
+func CtxFrom[T Context](r *http.Request) T {
+	return r.Context().Value(choCtxKey{}).(T)
+}
+
+// New creates a Cho backed by a fresh chi router. A built-in middleware at
+// position 0 creates the typed context via ctxMaker and stores it in
+// request.Context, making it available to all subsequent middleware and
+// the handler via CtxFrom.
 func New[T Context](em ContextMaker[T]) *Cho[T] {
-	return &Cho[T]{r: chi.NewRouter(), maker: em}
+	c := &Cho[T]{r: chi.NewRouter(), maker: em}
+
+	// Built-in #0 mw: create Ctx once, store in request context.
+	c.r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx := em(w, r)
+			*r = *r.WithContext(context.WithValue(r.Context(), choCtxKey{}, ctx))
+			next.ServeHTTP(w, r)
+		})
+	})
+
+	return c
 }
 
 // Router exposes the underlying chi.Router for advanced use (Routes(), Mount, etc).
 func (c *Cho[T]) Router() chi.Router { return c.r }
 
-// wrap is the single point where T is created. The handler writes its own
-// response; the framework writes nothing after it.
+// wrap is the single point where T is accessed. Each request reuses the
+// Ctx instance created by the built-in #0 middleware.
 func (c *Cho[T]) wrap(h Handler[T]) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		h(c.maker(w, r))
+		h(CtxFrom[T](r))
 	}
 }
 
 // Use appends global middleware. Must be called before any route is registered
 // on this router (chi enforces this with a panic).
 func (c *Cho[T]) Use(mws ...Middleware) { c.r.Use(mws...) }
+
+// UseCtx appends typed middleware. Each Mw is called per-request with the
+// T instance and the next handler in the chain. The Mw may mutate T (e.g. set
+// auth info) and must call next.ServeHTTP(ctx.W, ctx.R) to continue, or return
+// to short-circuit.
+func (c *Cho[T]) UseCtx(mws ...Mw[T]) {
+	for _, mw := range mws {
+		mw := mw
+		c.r.Use(func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mw(CtxFrom[T](r), next)
+			})
+		})
+	}
+}
 
 // With returns a Cho whose routes carry the given inline middleware.
 func (c *Cho[T]) With(mws ...Middleware) *Cho[T] {
