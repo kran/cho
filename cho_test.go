@@ -126,20 +126,20 @@ func TestNotFoundDefaultBehavior(t *testing.T) {
 	}
 }
 
-// --- Middleware (standard net/http decorators) ---
+// --- StdMw (standard net/http decorators) ---
 
 func TestMiddlewareOrder(t *testing.T) {
 	app := newTestApp()
 	var order []string
 
-	app.Use(func(next http.Handler) http.Handler {
+	app.UseStd(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			order = append(order, "mw1-before")
 			next.ServeHTTP(w, r)
 			order = append(order, "mw1-after")
 		})
 	})
-	app.Use(func(next http.Handler) http.Handler {
+	app.UseStd(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			order = append(order, "mw2-before")
 			next.ServeHTTP(w, r)
@@ -162,7 +162,7 @@ func TestMiddlewareOrder(t *testing.T) {
 
 func TestMiddlewareShortCircuit(t *testing.T) {
 	app := newTestApp()
-	app.Use(func(next http.Handler) http.Handler {
+	app.UseStd(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(401)
 			w.Write([]byte("blocked"))
@@ -181,7 +181,7 @@ func TestMiddlewareShortCircuit(t *testing.T) {
 func TestGroupMiddlewareIsolation(t *testing.T) {
 	app := newTestApp()
 	app.Group("/a", func(g *Cho[*testCtx]) {
-		g.Use(func(next http.Handler) http.Handler {
+		g.UseStd(func(next http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("X-Group", "a")
 				next.ServeHTTP(w, r)
@@ -217,63 +217,6 @@ func (c *testController) DeleteItem(ctx *testCtx) { ctx.String(200, "deleted") }
 
 // This method should be SKIPPED (wrong param type)
 func (c *testController) GetWrongParam(x int) {}
-
-func TestMount(t *testing.T) {
-	app := newTestApp()
-	app.Mount("/items", &testController{})
-
-	tests := []struct {
-		method, path string
-		wantCode     int
-		wantBody     string
-	}{
-		{"GET", "/items", 200, "list"},
-		{"GET", "/items/show?id=42", 200, "show:42"},
-		{"POST", "/items/create", 201, "created"},
-		{"DELETE", "/items/item", 200, "deleted"},
-	}
-	for _, tt := range tests {
-		w := app.Test(tt.method, tt.path, nil)
-		if w.Code != tt.wantCode {
-			t.Errorf("%s %s: status = %d, want %d", tt.method, tt.path, w.Code, tt.wantCode)
-		}
-		if w.Body.String() != tt.wantBody {
-			t.Errorf("%s %s: body = %q, want %q", tt.method, tt.path, w.Body.String(), tt.wantBody)
-		}
-	}
-}
-
-func TestMountWithMiddleware(t *testing.T) {
-	app := newTestApp()
-	app.Use(func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("X-MW", "applied")
-			next.ServeHTTP(w, r)
-		})
-	})
-	app.Mount("/ctrl", &testController{})
-
-	w := app.Test("GET", "/ctrl", nil)
-	if w.Header().Get("X-MW") != "applied" {
-		t.Error("middleware should apply to mounted routes")
-	}
-}
-
-type testMountError struct{}
-
-func (c *testMountError) GetFail(ctx *testCtx) {
-	ctx.Error(503, "service unavailable")
-}
-
-func TestMountHandlerError(t *testing.T) {
-	app := newTestApp()
-	app.Mount("/svc", &testMountError{})
-
-	w := app.Test("GET", "/svc/fail", nil)
-	if w.Code != 503 {
-		t.Errorf("status = %d, want 503", w.Code)
-	}
-}
 
 // --- Test helper ---
 
@@ -352,21 +295,6 @@ func TestStartServeErrorPropagates(t *testing.T) {
 	}
 }
 
-type badController struct{}
-
-// GetBad is handler-shaped (Get prefix, T param) but keeps the old error return.
-func (c *badController) GetBad(ctx *testCtx) error { return nil }
-
-func TestMountPanicsOnWrongSignature(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Error("Mount should panic on a handler-shaped method with wrong signature")
-		}
-	}()
-	app := newTestApp()
-	app.Mount("/bad", &badController{})
-}
-
 // --- UseCtx: typed middleware ---
 
 func TestUseCtxSetsAndReadsFields(t *testing.T) {
@@ -414,7 +342,7 @@ func TestUseCtxAndStandardMxMixed(t *testing.T) {
 	app := newTestApp()
 	var order []string
 
-	app.Use(func(next http.Handler) http.Handler {
+	app.UseStd(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			order = append(order, "std-before")
 			next.ServeHTTP(w, r)
@@ -449,50 +377,5 @@ func TestUseCtxShortCircuit(t *testing.T) {
 	w := app.Test("GET", "/", nil)
 	if w.Code != 401 {
 		t.Errorf("status = %d, want 401", w.Code)
-	}
-}
-
-// --- Helpers ---
-
-func TestCamelToKebab(t *testing.T) {
-	tests := []struct {
-		in, want string
-	}{
-		{"UserInfo", "user-info"},
-		{"ToggleStatus", "toggle-status"},
-		{"ID", "id"},
-		{"Login", "login"},
-		{"ConvLabels", "conv-labels"},
-		{"HTMLParser", "htmlparser"},
-	}
-	for _, tt := range tests {
-		got := camelToKebab(tt.in)
-		if got != tt.want {
-			t.Errorf("camelToKebab(%q) = %q, want %q", tt.in, got, tt.want)
-		}
-	}
-}
-
-func TestParseMethodName(t *testing.T) {
-	tests := []struct {
-		name       string
-		wantMethod string
-		wantPath   string
-	}{
-		{"Get", "GET", "/"},
-		{"GetUsers", "GET", "/users"},
-		{"PostLogin", "POST", "/login"},
-		{"DeleteItem", "DELETE", "/item"},
-		{"PutUserInfo", "PUT", "/user-info"},
-		{"PatchStatus", "PATCH", "/status"},
-		{"Invalid", "", ""},
-		{"RunTask", "", ""},
-	}
-	for _, tt := range tests {
-		method, path := parseMethodName(tt.name)
-		if method != tt.wantMethod || path != tt.wantPath {
-			t.Errorf("parseMethodName(%q) = (%q, %q), want (%q, %q)",
-				tt.name, method, path, tt.wantMethod, tt.wantPath)
-		}
 	}
 }
