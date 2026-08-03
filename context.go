@@ -88,6 +88,11 @@ func (b *BaseContext) SetHeader(key, value string) {
 	b.W.Header().Set(key, value)
 }
 
+// AddHeader adds a response header.
+func (b *BaseContext) AddHeader(key, value string) {
+	b.W.Header().Add(key, value)
+}
+
 // Cookie returns a named cookie from the request.
 func (b *BaseContext) Cookie(name string) (*http.Cookie, error) {
 	return b.R.Cookie(name)
@@ -118,14 +123,30 @@ func (b *BaseContext) ServeFile(filepath string) {
 	http.ServeFile(b.W, b.R, filepath)
 }
 
-// QueryInt64 returns a query parameter parsed as int64, or 0 if missing/invalid.
-func (b *BaseContext) QueryInt64(key string) int64 {
-	v := b.R.URL.Query().Get(key)
-	if v == "" {
+// QueryInt64 parses the query parameter as int64. When the parameter is
+// absent, def (or 0) is returned. A present-but-empty or unparsable value
+// yields 0 — Has() distinguishes "absent" from "explicitly passed".
+func (b *BaseContext) QueryInt64(key string, def ...int64) int64 {
+	q := b.R.URL.Query()
+	if !q.Has(key) {
+		if len(def) > 0 {
+			return def[0]
+		}
 		return 0
 	}
-	n, _ := strconv.ParseInt(v, 10, 64)
+	n, _ := strconv.ParseInt(q.Get(key), 10, 64)
 	return n
+}
+
+// QueryInt is QueryInt64 for int. Delegates to QueryInt64 — the parse/absent
+// semantics live in one place. On 32-bit platforms an out-of-range value
+// truncates instead of yielding 0 (documented platform difference).
+func (b *BaseContext) QueryInt(key string, def ...int) int {
+	def64 := make([]int64, len(def))
+	for i, d := range def {
+		def64[i] = int64(d)
+	}
+	return int(b.QueryInt64(key, def64...))
 }
 
 func (b *BaseContext) BindJson(v any) error {
@@ -248,11 +269,14 @@ func (b *BaseContext) SSE(fn func(send func(event, data string)), keepAlive ...t
 			return
 		default:
 		}
-		mu.Lock()
-		defer mu.Unlock()
+		// Reset outside the lock: Ticker.Reset is concurrency-safe and does not
+		// touch W — the mutex only guards W writes (event vs keep-alive).
+		// A keep-alive racing in after a reset is harmless (SSE clients ignore it).
 		if ticker != nil {
 			ticker.Reset(keepAlive[0])
 		}
+		mu.Lock()
+		defer mu.Unlock()
 		if event != "" {
 			fmt.Fprintf(b.W, "event: %s\n", event)
 		}

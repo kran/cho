@@ -30,7 +30,7 @@ func TestQuery(t *testing.T) {
 }
 
 func TestQueryInt64(t *testing.T) {
-	ctx, _ := makeCtx("GET", "/test?id=42&bad=abc", "")
+	ctx, _ := makeCtx("GET", "/test?id=42&bad=abc&empty=&zero=0", "")
 	if ctx.QueryInt64("id") != 42 {
 		t.Errorf("QueryInt64(id) = %d", ctx.QueryInt64("id"))
 	}
@@ -39,6 +39,35 @@ func TestQueryInt64(t *testing.T) {
 	}
 	if ctx.QueryInt64("missing") != 0 {
 		t.Errorf("QueryInt64(missing) = %d", ctx.QueryInt64("missing"))
+	}
+	// default applies only when absent — not for empty/zero
+	if ctx.QueryInt64("missing", 7) != 7 {
+		t.Errorf("QueryInt64(missing, 7) = %d", ctx.QueryInt64("missing", 7))
+	}
+	if ctx.QueryInt64("empty", 7) != 0 {
+		t.Errorf("QueryInt64(empty, 7) = %d", ctx.QueryInt64("empty", 7))
+	}
+	if ctx.QueryInt64("zero", 7) != 0 {
+		t.Errorf("QueryInt64(zero, 7) = %d", ctx.QueryInt64("zero", 7))
+	}
+}
+
+func TestQueryInt(t *testing.T) {
+	ctx, _ := makeCtx("GET", "/test?id=42&bad=abc&empty=", "")
+	if ctx.QueryInt("id") != 42 {
+		t.Errorf("QueryInt(id) = %d", ctx.QueryInt("id"))
+	}
+	if ctx.QueryInt("bad") != 0 {
+		t.Errorf("QueryInt(bad) = %d", ctx.QueryInt("bad"))
+	}
+	if ctx.QueryInt("missing") != 0 {
+		t.Errorf("QueryInt(missing) = %d", ctx.QueryInt("missing"))
+	}
+	if ctx.QueryInt("missing", 9) != 9 {
+		t.Errorf("QueryInt(missing, 9) = %d", ctx.QueryInt("missing", 9))
+	}
+	if ctx.QueryInt("empty", 9) != 0 {
+		t.Errorf("QueryInt(empty, 9) = %d", ctx.QueryInt("empty", 9))
 	}
 }
 

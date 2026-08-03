@@ -19,6 +19,8 @@ import (
 // Handler is a typed HTTP handler. T is the only place the generic context
 // lives. Like net/http, a handler writes its own response and returns nothing —
 // there is no framework error-to-response conversion.
+// Error responses are the custom Context's job (e.g. ctx.Error(status, msg)
+// defined on your own context struct) — the framework stays concept-free.
 type Handler[T Context] func(T)
 
 // StdMw is the standard net/http decorator. chi and any net/http
@@ -45,15 +47,14 @@ type Cho[T Context] struct {
 	once sync.Once
 }
 
-// choCtxKey is the key for the typed context in request.Context.
-// Unexported — only accessible through CtxFrom.
-type choCtxKey struct{}
+// choCtxKeyInst is the singleton key instance.
+var choCtxKeyInst = &struct{}{}
 
 // CtxFrom extracts the typed context T from the request. The context is
 // created by a built-in middleware at position 0 in the chain, so it is
 // available to all subsequent middleware and the handler.
 func CtxFrom[T Context](r *http.Request) T {
-	return r.Context().Value(choCtxKey{}).(T)
+	return r.Context().Value(choCtxKeyInst).(T)
 }
 
 // New creates a Cho backed by a fresh chi router. A built-in middleware at
@@ -67,7 +68,7 @@ func New[T Context](em CtxMaker[T]) *Cho[T] {
 	c.r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ctx := em(w, r)
-			*r = *r.WithContext(context.WithValue(r.Context(), choCtxKey{}, ctx))
+			*r = *r.WithContext(context.WithValue(r.Context(), choCtxKeyInst, ctx))
 			next.ServeHTTP(w, r)
 		})
 	})
@@ -95,8 +96,8 @@ func (c *Cho[T]) UseStd(mws ...StdMw) { c.r.Use(mws...) }
 // auth info) and must call next.ServeHTTP(ctx.W, ctx.R) to continue, or return
 // to short-circuit.
 func (c *Cho[T]) UseCtx(mws ...CtxMw[T]) {
+	// Go 1.22+ loop variables are per-iteration, so mw needs no capture copy.
 	for _, mw := range mws {
-		mw := mw
 		c.r.Use(func(next http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				mw(CtxFrom[T](r), next)
