@@ -9,7 +9,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
@@ -27,12 +26,18 @@ type Handler[T Context] func(T)
 // middleware are usable as-is — no generics.
 type StdMw = func(http.Handler) http.Handler
 
-// CtxMw is a typed middleware. ctx carries the request-scoped T (with W and R
-// available via the Context interface). Call next.ServeHTTP(ctx.W, ctx.R) to
-// continue the chain; return without calling next to short-circuit.
-type CtxMw[T Context] func(ctx T, next http.Handler)
+// CtxMw is a typed middleware. ctx carries the request-scoped T; call next()
+// to continue the chain (the framework closes over the current w/r), or
+// return without calling it to short-circuit. Access the raw w/r via
+// ctx.Res()/ctx.Req() when needed.
+type CtxMw[T Context] func(ctx T, next func())
 
 // CtxMaker creates a fresh T from the raw writer/request, once per request.
+// The request passed to the maker is the derived request the chain starts
+// with (cho introduces no context fork of its own). Note: std middleware
+// registered via UseStd may further derive the request (WithContext) —
+// values/deadlines they attach are NOT visible through T's stored request;
+// read the live r from your own middleware layer when that matters.
 type CtxMaker[T Context] func(http.ResponseWriter, *http.Request) T
 
 // Cho is a thin generic facade over chi.Router. Its only job is to adapt
@@ -41,20 +46,28 @@ type CtxMaker[T Context] func(http.ResponseWriter, *http.Request) T
 type Cho[T Context] struct {
 	r     chi.Router
 	maker CtxMaker[T]
-
-	NotFound Handler[T]
-
-	once sync.Once
 }
 
 // choCtxKeyInst is the singleton key instance.
 var choCtxKeyInst = &struct{}{}
 
+// choHolder is a mutable slot in the request context: the built-in #0
+// middleware stores an empty holder, derives the new request, then fills the
+// holder with the CtxMaker result — so T.R is always the very request the
+// rest of the chain sees (no context fork between maker and handler).
+type choHolder[T Context] struct{ v T }
+
 // CtxFrom extracts the typed context T from the request. The context is
 // created by a built-in middleware at position 0 in the chain, so it is
 // available to all subsequent middleware and the handler.
+// Panics with a pointing message when the request carries no context of
+// this type (e.g. handlers mounted across Cho instances, or raw chi routes).
 func CtxFrom[T Context](r *http.Request) T {
-	return r.Context().Value(choCtxKeyInst).(T)
+	h, ok := r.Context().Value(choCtxKeyInst).(*choHolder[T])
+	if !ok {
+		panic("cho: no context of this type on request — handler/middleware registered outside its Cho[T] instance?")
+	}
+	return h.v
 }
 
 // New creates a Cho backed by a fresh chi router. A built-in middleware at
@@ -64,11 +77,16 @@ func CtxFrom[T Context](r *http.Request) T {
 func New[T Context](em CtxMaker[T]) *Cho[T] {
 	c := &Cho[T]{r: chi.NewRouter(), maker: em}
 
-	// Built-in #0 mw: create Ctx once, store in request context.
+	// Built-in #0 mw: store an empty holder, derive the request context, then
+	// create Ctx from the NEW request and fill the holder — T.R is the same
+	// pointer the rest of the chain sees (no context fork). Never overwrite
+	// *r in place — net/http may hold the request reference after the handler
+	// returns (data race); pass the derived request down.
 	c.r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ctx := em(w, r)
-			*r = *r.WithContext(context.WithValue(r.Context(), choCtxKeyInst, ctx))
+			h := &choHolder[T]{}
+			r = r.WithContext(context.WithValue(r.Context(), choCtxKeyInst, h))
+			h.v = em(w, r)
 			next.ServeHTTP(w, r)
 		})
 	})
@@ -92,21 +110,24 @@ func (c *Cho[T]) wrap(h Handler[T]) http.HandlerFunc {
 func (c *Cho[T]) UseStd(mws ...StdMw) { c.r.Use(mws...) }
 
 // UseCtx appends typed middleware. Each CtxMw is called per-request with the
-// T instance and the next handler in the chain. The CtxMw may mutate T (e.g. set
-// auth info) and must call next.ServeHTTP(ctx.W, ctx.R) to continue, or return
-// to short-circuit.
+// T instance; call next() to continue the chain (the framework closes over
+// the current w/r), or return without calling it to short-circuit. The CtxMw
+// may mutate T (e.g. set auth info) — visible to the handler and later CtxMw's.
 func (c *Cho[T]) UseCtx(mws ...CtxMw[T]) {
 	// Go 1.22+ loop variables are per-iteration, so mw needs no capture copy.
 	for _, mw := range mws {
 		c.r.Use(func(next http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				mw(CtxFrom[T](r), next)
+				mw(CtxFrom[T](r), func() { next.ServeHTTP(w, r) })
 			})
 		})
 	}
 }
 
 // With returns a Cho whose routes carry the given inline middleware.
+// The returned Cho is for route registration only — do not call UseStd/UseCtx
+// on it (chi's With returns an inline-middleware router; adding middleware
+// afterwards is unsupported).
 func (c *Cho[T]) With(mws ...StdMw) *Cho[T] {
 	return &Cho[T]{r: c.r.With(mws...), maker: c.maker}
 }
@@ -129,17 +150,15 @@ func (c *Cho[T]) Put(path string, h Handler[T])    { c.r.Put(path, c.wrap(h)) }
 func (c *Cho[T]) Delete(path string, h Handler[T]) { c.r.Delete(path, c.wrap(h)) }
 func (c *Cho[T]) Patch(path string, h Handler[T])  { c.r.Patch(path, c.wrap(h)) }
 
-// ServeHTTP implements http.Handler.
-func (c *Cho[T]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	c.once.Do(c.build)
-	c.r.ServeHTTP(w, r)
+// SetNotFound registers a typed 404 handler directly on the router
+// (router-scoped in chi — set it on the root instance or any group).
+func (c *Cho[T]) SetNotFound(h Handler[T]) {
+	c.r.NotFound(c.wrap(h))
 }
 
-// build registers deferred config (NotFound) onto chi before first serve.
-func (c *Cho[T]) build() {
-	if c.NotFound != nil {
-		c.r.NotFound(c.wrap(c.NotFound))
-	}
+// ServeHTTP implements http.Handler.
+func (c *Cho[T]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	c.r.ServeHTTP(w, r)
 }
 
 // Test sends a request through the full router and records the response.
@@ -155,7 +174,6 @@ func (c *Cho[T]) Test(method, target string, body io.Reader) *httptest.ResponseR
 // http.ErrServerClosed on a clean shutdown — so callers can observe a server
 // that dies on its own instead of silently swallowing the error.
 func (c *Cho[T]) Start(port int, server ...*http.Server) (*http.Server, <-chan error, error) {
-	c.once.Do(c.build)
 	var srv *http.Server
 	if len(server) > 0 && server[0] != nil {
 		srv = server[0]

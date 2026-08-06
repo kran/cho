@@ -100,7 +100,7 @@ carries the policy.
 ```go
 type Handler[T Context]   func(T)                                  // typed handler
 type StdMw                = func(http.Handler) http.Handler        // standard decorator (chi/net/http)
-type CtxMw[T Context]     func(ctx T, next http.Handler)           // typed middleware
+type CtxMw[T Context]     func(ctx T, next func())                 // typed middleware
 type CtxMaker[T Context]  func(http.ResponseWriter, *http.Request) T
 
 type Context interface {   // implemented by BaseContext (embed it)
@@ -121,7 +121,7 @@ app.Delete(path, handler)
 app.Patch(path, handler)
 app.Handle(method, path, handler)      // arbitrary method
 
-app.NotFound = func(ctx *AppContext) { ctx.Json(404, map[string]string{"error": "not found"}) }
+app.SetNotFound(func(ctx *AppContext) { ctx.Json(404, map[string]string{"error": "not found"}) })
 
 // chi itself for advanced use (Routes, Mount, MethodNotAllowed, ...)
 app.Router().MethodNotAllowed(...)
@@ -140,7 +140,7 @@ app.UseStd(middleware.Logger, middleware.Recoverer)
 // Typed middleware — receives T, may mutate it, continues via next:
 app.UseCtx(func(ctx *AppContext, next http.Handler) {
     ctx.UserID = 42          // visible to handler and later CtxMw's
-    next.ServeHTTP(ctx.Res(), ctx.Req())
+    next()                   // continue the chain; return without it to short-circuit
     // return without calling next to short-circuit
 })
 

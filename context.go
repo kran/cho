@@ -39,6 +39,9 @@ type BaseContext struct {
 	W         http.ResponseWriter
 	R         *http.Request
 	validator func(any) error
+
+	// MaxFormMemory limits multipart form parsing in BindForm; 0 = 32 MB default.
+	MaxFormMemory int64
 }
 
 // SetValidator configures a validation function that runs automatically
@@ -184,7 +187,11 @@ func (b *BaseContext) FormFiles(key string) ([]*multipart.FileHeader, error) {
 func (b *BaseContext) BindForm(v any) error {
 	ct := b.R.Header.Get("Content-Type")
 	if strings.HasPrefix(ct, "multipart/") {
-		if err := b.R.ParseMultipartForm(32 << 20); err != nil {
+		limit := b.MaxFormMemory
+		if limit <= 0 {
+			limit = 32 << 20
+		}
+		if err := b.R.ParseMultipartForm(limit); err != nil {
 			return fmt.Errorf("bind form error: %w", err)
 		}
 	} else {
@@ -241,9 +248,12 @@ func (b *BaseContext) SSE(fn func(send func(event, data string)), keepAlive ...t
 	flusher.Flush()
 
 	done := b.R.Context().Done()
+	stop := make(chan struct{})
+	defer close(stop) // stop the keep-alive goroutine when fn returns
 	var mu sync.Mutex
 
-	// Keep-alive goroutine
+	// Keep-alive goroutine — exits on client disconnect OR handler return
+	// (writing to W after the handler returned is undefined behavior).
 	var ticker *time.Ticker
 	if len(keepAlive) > 0 && keepAlive[0] > 0 {
 		ticker = time.NewTicker(keepAlive[0])
@@ -252,6 +262,8 @@ func (b *BaseContext) SSE(fn func(send func(event, data string)), keepAlive ...t
 			for {
 				select {
 				case <-done:
+					return
+				case <-stop:
 					return
 				case <-ticker.C:
 					mu.Lock()

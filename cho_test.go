@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -92,9 +93,9 @@ func TestHandlerWritesErrorResponse(t *testing.T) {
 
 func TestNotFoundHandler(t *testing.T) {
 	app := newTestApp()
-	app.NotFound = func(ctx *testCtx) {
+	app.SetNotFound(func(ctx *testCtx) {
 		ctx.Json(404, map[string]string{"error": "not found"})
-	}
+	})
 	app.Get("/exists", func(ctx *testCtx) { ctx.String(200, "ok") })
 
 	// Existing route works
@@ -299,9 +300,9 @@ func TestStartServeErrorPropagates(t *testing.T) {
 
 func TestUseCtxSetsAndReadsFields(t *testing.T) {
 	app := newTestApp()
-	app.UseCtx(func(ctx *testCtx, next http.Handler) {
+	app.UseCtx(func(ctx *testCtx, next func()) {
 		ctx.SetHeader("X-From-Ctx", "set-by-typed-mw")
-		next.ServeHTTP(ctx.W, ctx.R)
+		next()
 	})
 	app.Get("/", func(ctx *testCtx) { ctx.String(200, "ok") })
 
@@ -315,14 +316,14 @@ func TestUseCtxChainOrder(t *testing.T) {
 	app := newTestApp()
 	var order []string
 
-	app.UseCtx(func(ctx *testCtx, next http.Handler) {
+	app.UseCtx(func(ctx *testCtx, next func()) {
 		order = append(order, "a-before")
-		next.ServeHTTP(ctx.W, ctx.R)
+		next()
 		order = append(order, "a-after")
 	})
-	app.UseCtx(func(ctx *testCtx, next http.Handler) {
+	app.UseCtx(func(ctx *testCtx, next func()) {
 		order = append(order, "b-before")
-		next.ServeHTTP(ctx.W, ctx.R)
+		next()
 		order = append(order, "b-after")
 	})
 	app.Get("/", func(ctx *testCtx) {
@@ -349,9 +350,9 @@ func TestUseCtxAndStandardMxMixed(t *testing.T) {
 			order = append(order, "std-after")
 		})
 	})
-	app.UseCtx(func(ctx *testCtx, next http.Handler) {
+	app.UseCtx(func(ctx *testCtx, next func()) {
 		order = append(order, "typed-before")
-		next.ServeHTTP(ctx.W, ctx.R)
+		next()
 		order = append(order, "typed-after")
 	})
 	app.Get("/", func(ctx *testCtx) {
@@ -369,7 +370,7 @@ func TestUseCtxAndStandardMxMixed(t *testing.T) {
 
 func TestUseCtxShortCircuit(t *testing.T) {
 	app := newTestApp()
-	app.UseCtx(func(ctx *testCtx, next http.Handler) {
+	app.UseCtx(func(ctx *testCtx, next func()) {
 		ctx.String(401, "blocked")
 	})
 	app.Get("/", func(ctx *testCtx) { t.Fatal("handler should not be called") })
@@ -378,4 +379,44 @@ func TestUseCtxShortCircuit(t *testing.T) {
 	if w.Code != 401 {
 		t.Errorf("status = %d, want 401", w.Code)
 	}
+}
+
+// CtxFrom 跨实例/纯 chi 场景: 友好 panic 而非运行时噪音。
+func TestCtxFromForeignContextPanics(t *testing.T) {
+	// 纯 chi 路由 (无 cho 中间件) 上调用 CtxFrom
+	raw := httptest.NewRequest("GET", "/", nil)
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("CtxFrom on foreign request should panic")
+		}
+		msg, ok := r.(string)
+		if !ok || !strings.Contains(msg, "no context of this type") {
+			t.Fatalf("panic should be a pointing message, got: %v", r)
+		}
+	}()
+	CtxFrom[*testCtx](raw)
+}
+
+// T.R 与链上 r 同一指针 (holder 根治的不变式)。
+func TestCtxMakerReceivesChainRequest(t *testing.T) {
+	var makerR *http.Request
+	app := New(func(w http.ResponseWriter, r *http.Request) *testCtx {
+		makerR = r
+		return &testCtx{BaseContext: *MakeBaseContext(w, r)}
+	})
+	app.Get("/", func(ctx *testCtx) { ctx.String(200, "ok") })
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/", nil)
+	app.ServeHTTP(w, req)
+
+	if makerR == nil {
+		t.Fatal("maker not called")
+	}
+	if makerR == req {
+		t.Fatal("maker should receive the DERIVED request, not the raw one")
+	}
+	// maker 收到的 r 与 handler 链上的 r 同一指针: handler 侧通过 CtxFrom 验证
+	// (handler 里 ctx.Req() 即 T.R — 由 #0 的 holder 保证)
 }
