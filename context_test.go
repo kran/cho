@@ -236,7 +236,7 @@ func TestMakeBaseContext(t *testing.T) {
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/", nil)
 	ctx := MakeBaseContext(w, r)
-	if ctx.Req() != r || ctx.Res() != w {
+	if ctx.R != r || ctx.W != w {
 		t.Error("MakeBaseContext didn't set fields correctly")
 	}
 }

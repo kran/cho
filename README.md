@@ -103,10 +103,9 @@ type StdMw                = func(http.Handler) http.Handler        // standard d
 type CtxMw[T Context]     func(ctx T, next func())                 // typed middleware
 type CtxMaker[T Context]  func(http.ResponseWriter, *http.Request) T
 
-type Context interface {   // implemented by BaseContext (embed it)
-    Req() *http.Request
-    Res() http.ResponseWriter
-}
+// T is unconstrained — the framework never calls any method on it
+// (it only creates/stores/retrieves/passes T). Embed BaseContext for the
+// helpers, or define your own shape entirely.
 ```
 
 ### Router

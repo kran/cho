@@ -21,20 +21,14 @@ var formDecoder = func() *schema.Decoder {
 	return d
 }()
 
-// Context is the interface that all Cho handler contexts must implement.
-type Context interface {
-	Req() *http.Request
-	Res() http.ResponseWriter
-}
-
 // Validatable can be implemented by request structs to provide custom validation logic.
 // If a bound struct implements this interface, Validate is called automatically after binding.
 type Validatable interface {
 	Validate() error
 }
 
-// BaseContext is the default Context implementation. Embed it in your own context struct
-// to satisfy the Context interface and gain helper methods.
+// BaseContext is the default request context. Embed it in your own context
+// struct to gain request/response access (W/R fields) and the helper methods.
 type BaseContext struct {
 	W         http.ResponseWriter
 	R         *http.Request
@@ -65,9 +59,6 @@ func (b *BaseContext) runValidation(v any) error {
 func MakeBaseContext(writer http.ResponseWriter, request *http.Request) *BaseContext {
 	return &BaseContext{W: writer, R: request}
 }
-
-func (b *BaseContext) Req() *http.Request       { return b.R }
-func (b *BaseContext) Res() http.ResponseWriter { return b.W }
 
 func (b *BaseContext) PathValue(key string) string {
 	return b.R.PathValue(key)

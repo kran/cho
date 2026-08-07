@@ -20,7 +20,7 @@ import (
 // there is no framework error-to-response conversion.
 // Error responses are the custom Context's job (e.g. ctx.Error(status, msg)
 // defined on your own context struct) — the framework stays concept-free.
-type Handler[T Context] func(T)
+type Handler[T any] func(T)
 
 // StdMw is the standard net/http decorator. chi and any net/http
 // middleware are usable as-is — no generics.
@@ -30,7 +30,7 @@ type StdMw = func(http.Handler) http.Handler
 // to continue the chain (the framework closes over the current w/r), or
 // return without calling it to short-circuit. Access the raw w/r via
 // ctx.Res()/ctx.Req() when needed.
-type CtxMw[T Context] func(ctx T, next func())
+type CtxMw[T any] func(ctx T, next func())
 
 // CtxMaker creates a fresh T from the raw writer/request, once per request.
 // The request passed to the maker is the derived request the chain starts
@@ -38,12 +38,12 @@ type CtxMw[T Context] func(ctx T, next func())
 // registered via UseStd may further derive the request (WithContext) —
 // values/deadlines they attach are NOT visible through T's stored request;
 // read the live r from your own middleware layer when that matters.
-type CtxMaker[T Context] func(http.ResponseWriter, *http.Request) T
+type CtxMaker[T any] func(http.ResponseWriter, *http.Request) T
 
 // Cho is a thin generic facade over chi.Router. Its only job is to adapt
 // func(T) handlers into http.HandlerFunc; routing, middleware and grouping are
 // all chi's.
-type Cho[T Context] struct {
+type Cho[T any] struct {
 	r     chi.Router
 	maker CtxMaker[T]
 }
@@ -55,14 +55,14 @@ var choCtxKeyInst = &struct{}{}
 // middleware stores an empty holder, derives the new request, then fills the
 // holder with the CtxMaker result — so T.R is always the very request the
 // rest of the chain sees (no context fork between maker and handler).
-type choHolder[T Context] struct{ v T }
+type choHolder[T any] struct{ v T }
 
 // CtxFrom extracts the typed context T from the request. The context is
 // created by a built-in middleware at position 0 in the chain, so it is
 // available to all subsequent middleware and the handler.
 // Panics with a pointing message when the request carries no context of
 // this type (e.g. handlers mounted across Cho instances, or raw chi routes).
-func CtxFrom[T Context](r *http.Request) T {
+func CtxFrom[T any](r *http.Request) T {
 	h, ok := r.Context().Value(choCtxKeyInst).(*choHolder[T])
 	if !ok {
 		panic("cho: no context of this type on request — handler/middleware registered outside its Cho[T] instance?")
@@ -74,7 +74,7 @@ func CtxFrom[T Context](r *http.Request) T {
 // position 0 creates the typed context via ctxMaker and stores it in
 // request.Context, making it available to all subsequent middleware and
 // the handler via CtxFrom.
-func New[T Context](em CtxMaker[T]) *Cho[T] {
+func New[T any](em CtxMaker[T]) *Cho[T] {
 	c := &Cho[T]{r: chi.NewRouter(), maker: em}
 
 	// Built-in #0 mw: store an empty holder, derive the request context, then
