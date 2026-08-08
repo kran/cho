@@ -205,6 +205,88 @@ func TestGroupMiddlewareIsolation(t *testing.T) {
 	}
 }
 
+// 前缀式 Group 的回归测试: 精确路由与同名子树任意顺序共存
+// (chi Route/Mount 的 mSTUB 静默覆盖坑, Group 不再有)。
+func TestGroupExactCoexistsWithSubtree(t *testing.T) {
+	app := newTestApp()
+	app.Get("/admin", func(ctx *testCtx) { ctx.String(200, "exact") })
+	app.Group("/admin", func(g *Cho[*testCtx]) {
+		g.Get("/ui/*", func(ctx *testCtx) { ctx.String(200, "ui") })
+	})
+
+	if w := app.Test("GET", "/admin", nil); w.Body.String() != "exact" {
+		t.Errorf("GET /admin = %q (code %d), want exact", w.Body.String(), w.Code)
+	}
+	if w := app.Test("GET", "/admin/ui/a.js", nil); w.Body.String() != "ui" {
+		t.Errorf("GET /admin/ui/a.js = %q, want ui", w.Body.String())
+	}
+
+	// 反序: Group 先注册, 精确后注册 — 同样共存
+	app2 := newTestApp()
+	app2.Group("/admin", func(g *Cho[*testCtx]) {
+		g.Get("/ui/*", func(ctx *testCtx) { ctx.String(200, "ui") })
+	})
+	app2.Get("/admin", func(ctx *testCtx) { ctx.String(200, "exact") })
+	if w := app2.Test("GET", "/admin", nil); w.Body.String() != "exact" {
+		t.Errorf("reverse order GET /admin = %q (code %d), want exact", w.Body.String(), w.Code)
+	}
+}
+
+// 组内 UseStd 挂起: 对此后注册的组内路由生效; 嵌套组前缀拼接。
+func TestGroupPendingMiddleware(t *testing.T) {
+	app := newTestApp()
+	app.Group("/api", func(g *Cho[*testCtx]) {
+		g.Get("/before", func(ctx *testCtx) { ctx.String(200, "before") })
+		g.UseStd(func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("X-Mw", "on")
+				next.ServeHTTP(w, r)
+			})
+		})
+		g.Get("/after", func(ctx *testCtx) { ctx.String(200, "after") })
+		g.Group("/v2", func(g2 *Cho[*testCtx]) {
+			g2.Get("/items", func(ctx *testCtx) { ctx.String(200, "v2") })
+		})
+	})
+
+	// 挂起前注册的路由不带 mw
+	if w := app.Test("GET", "/api/before", nil); w.Header().Get("X-Mw") != "" {
+		t.Error("route registered before UseStd must not get the middleware")
+	}
+	// 挂起后注册的路由带 mw
+	if w := app.Test("GET", "/api/after", nil); w.Header().Get("X-Mw") != "on" {
+		t.Error("route registered after UseStd must get the middleware")
+	}
+	// 嵌套组: 前缀拼接 + 继承挂起 mw
+	w := app.Test("GET", "/api/v2/items", nil)
+	if w.Body.String() != "v2" || w.Header().Get("X-Mw") != "on" {
+		t.Errorf("nested group: body=%q mw=%q", w.Body.String(), w.Header().Get("X-Mw"))
+	}
+}
+
+// With 返回的子实例可继续 UseStd (chi 原生 With 的限制被挂起机制解除)。
+func TestWithThenUseStd(t *testing.T) {
+	app := newTestApp()
+	a := app.With(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-A", "1")
+			next.ServeHTTP(w, r)
+		})
+	})
+	a.UseStd(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-B", "2")
+			next.ServeHTTP(w, r)
+		})
+	})
+	a.Get("/x", func(ctx *testCtx) { ctx.String(200, "x") })
+
+	w := app.Test("GET", "/x", nil)
+	if w.Header().Get("X-A") != "1" || w.Header().Get("X-B") != "2" {
+		t.Errorf("With+UseStd: A=%q B=%q", w.Header().Get("X-A"), w.Header().Get("X-B"))
+	}
+}
+
 // --- Mount ---
 
 type testController struct{}

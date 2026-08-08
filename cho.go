@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/signal"
+	"slices"
 	"syscall"
 	"time"
 
@@ -44,8 +45,11 @@ type CtxMaker[T any] func(http.ResponseWriter, *http.Request) T
 // func(T) handlers into http.HandlerFunc; routing, middleware and grouping are
 // all chi's.
 type Cho[T any] struct {
-	r     chi.Router
-	maker CtxMaker[T]
+	r      chi.Router
+	maker  CtxMaker[T]
+	prefix string  // Group 累积的路径前缀
+	mws    []StdMw // 挂起中间件: With/组内 UseStd 累积, 路由注册时内联生效
+	scoped bool    // 组/With 子实例: UseStd 改为挂起而非全局 Use
 }
 
 // choCtxKeyInst is the singleton key instance.
@@ -107,48 +111,84 @@ func (c *Cho[T]) wrap(h Handler[T]) http.HandlerFunc {
 
 // UseStd appends global middleware. Must be called before any route is registered
 // on this router (chi enforces this with a panic).
-func (c *Cho[T]) UseStd(mws ...StdMw) { c.r.Use(mws...) }
+//
+// 在 Group/With 子实例上调用时语义变为: 追加到该作用域的挂起列表, 对此后
+// 注册的作用域内路由生效 (不再是全局, 也不触发 chi 的 use-after-routes panic)。
+func (c *Cho[T]) UseStd(mws ...StdMw) {
+	if c.scoped {
+		c.mws = append(c.mws, mws...)
+		return
+	}
+	c.r.Use(mws...)
+}
 
 // UseCtx appends typed middleware. Each CtxMw is called per-request with the
 // T instance; call next() to continue the chain (the framework closes over
 // the current w/r), or return without calling it to short-circuit. The CtxMw
 // may mutate T (e.g. set auth info) — visible to the handler and later CtxMw's.
+// 作用域语义同 UseStd。
 func (c *Cho[T]) UseCtx(mws ...CtxMw[T]) {
 	// Go 1.22+ loop variables are per-iteration, so mw needs no capture copy.
 	for _, mw := range mws {
-		c.r.Use(func(next http.Handler) http.Handler {
+		std := func(next http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				mw(CtxFrom[T](r), func() { next.ServeHTTP(w, r) })
 			})
-		})
+		}
+		if c.scoped {
+			c.mws = append(c.mws, std)
+		} else {
+			c.r.Use(std)
+		}
 	}
 }
 
-// With returns a Cho whose routes carry the given inline middleware.
-// The returned Cho is for route registration only — do not call UseStd/UseCtx
-// on it (chi's With returns an inline-middleware router; adding middleware
-// afterwards is unsupported).
+// With returns a Cho whose subsequently registered routes carry the given
+// inline middleware. 与 chi 原生 With 不同: 返回的实例仍可 UseStd/UseCtx
+// (追加挂起, 不再有 "With 后不能 Use" 的限制)。
 func (c *Cho[T]) With(mws ...StdMw) *Cho[T] {
-	return &Cho[T]{r: c.r.With(mws...), maker: c.maker}
+	return &Cho[T]{
+		r: c.r, maker: c.maker, prefix: c.prefix, scoped: true,
+		mws: append(slices.Clone(c.mws), mws...),
+	}
 }
 
-// Group mounts a sub-router at prefix with its own middleware scope.
+// Group 纯路径前缀分组 (不经 chi.Route): 注册路径 = 前缀 + path。
+//
+// 为什么不用 chi.Route: Route = Mount, Mount 会在精确节点注册 mSTUB 占位
+// handler 转给子路由, 同路径已注册的精确 handler 会被静默覆盖 (顺序敏感、
+// 无 panic) — 前缀式 Group 没有这个坑, 精确路由与子树任意顺序共存,
+// 真重复注册由 chi 原生 duplicate panic 响亮报出。
+//
+// 注意: 组的中间件作用域 = 组内 UseStd/UseCtx 挂起, 对此后注册的组内路由
+// 生效; SetNotFound 仍是路由器级 (组内调用影响整个路由器), 与 chi Route
+// 子路由的独立 NotFound 语义不同。
 func (c *Cho[T]) Group(prefix string, fn func(*Cho[T])) {
-	c.r.Route(prefix, func(r chi.Router) {
-		fn(&Cho[T]{r: r, maker: c.maker})
+	fn(&Cho[T]{
+		r: c.r, maker: c.maker, prefix: c.prefix + prefix, scoped: true,
+		mws: slices.Clone(c.mws),
 	})
 }
 
 // Handle registers a typed handler for an arbitrary method/path.
 func (c *Cho[T]) Handle(method, path string, h Handler[T]) {
-	c.r.Method(method, path, c.wrap(h))
+	c.method(method, path, h)
 }
 
-func (c *Cho[T]) Get(path string, h Handler[T])    { c.r.Get(path, c.wrap(h)) }
-func (c *Cho[T]) Post(path string, h Handler[T])   { c.r.Post(path, c.wrap(h)) }
-func (c *Cho[T]) Put(path string, h Handler[T])    { c.r.Put(path, c.wrap(h)) }
-func (c *Cho[T]) Delete(path string, h Handler[T]) { c.r.Delete(path, c.wrap(h)) }
-func (c *Cho[T]) Patch(path string, h Handler[T])  { c.r.Patch(path, c.wrap(h)) }
+func (c *Cho[T]) method(method, path string, h Handler[T]) {
+	hf := c.wrap(h)
+	if len(c.mws) > 0 {
+		c.r.With(c.mws...).Method(method, c.prefix+path, hf)
+		return
+	}
+	c.r.Method(method, c.prefix+path, hf)
+}
+
+func (c *Cho[T]) Get(path string, h Handler[T])    { c.method(http.MethodGet, path, h) }
+func (c *Cho[T]) Post(path string, h Handler[T])   { c.method(http.MethodPost, path, h) }
+func (c *Cho[T]) Put(path string, h Handler[T])    { c.method(http.MethodPut, path, h) }
+func (c *Cho[T]) Delete(path string, h Handler[T]) { c.method(http.MethodDelete, path, h) }
+func (c *Cho[T]) Patch(path string, h Handler[T])  { c.method(http.MethodPatch, path, h) }
 
 // SetNotFound registers a typed 404 handler directly on the router
 // (router-scoped in chi — set it on the root instance or any group).
