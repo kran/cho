@@ -287,6 +287,73 @@ func TestWithThenUseStd(t *testing.T) {
 	}
 }
 
+// UseCtx 挂起路径: 类型化中间件在组上注册, 对组内路由生效且不外泄。
+func TestUseCtxOnGroup(t *testing.T) {
+	app := newTestApp()
+	app.Group("/a", func(g *Cho[*testCtx]) {
+		g.UseCtx(func(ctx *testCtx, next func()) {
+			ctx.SetHeader("X-Ctx-Mw", "typed")
+			next()
+		})
+		g.Get("/in", func(ctx *testCtx) { ctx.String(200, "in") })
+	})
+	app.Get("/out", func(ctx *testCtx) { ctx.String(200, "out") })
+
+	w := app.Test("GET", "/a/in", nil)
+	if w.Body.String() != "in" || w.Header().Get("X-Ctx-Mw") != "typed" {
+		t.Errorf("group UseCtx: body=%q mw=%q", w.Body.String(), w.Header().Get("X-Ctx-Mw"))
+	}
+	if w := app.Test("GET", "/out", nil); w.Header().Get("X-Ctx-Mw") != "" {
+		t.Error("group UseCtx must not leak to parent routes")
+	}
+}
+
+// 全局 UseStd (根) 与组内挂起 mw 的链序: 全局先, 组内后; 各自作用域正确。
+func TestGlobalAndGroupMiddlewareChain(t *testing.T) {
+	app := newTestApp()
+	var order []string
+	app.UseStd(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			order = append(order, "global")
+			next.ServeHTTP(w, r)
+		})
+	})
+	app.Group("/g", func(g *Cho[*testCtx]) {
+		g.UseStd(func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				order = append(order, "group")
+				next.ServeHTTP(w, r)
+			})
+		})
+		g.Get("/x", func(ctx *testCtx) { ctx.String(200, "x") })
+	})
+	app.Get("/plain", func(ctx *testCtx) { ctx.String(200, "plain") })
+
+	order = nil
+	app.Test("GET", "/g/x", nil)
+	if len(order) != 2 || order[0] != "global" || order[1] != "group" {
+		t.Errorf("group route chain order = %v, want [global group]", order)
+	}
+
+	order = nil
+	app.Test("GET", "/plain", nil)
+	if len(order) != 1 || order[0] != "global" {
+		t.Errorf("plain route chain = %v, want [global] only", order)
+	}
+}
+
+// 根 UseStd 在路由注册后调用 → chi panic 纪律保留 (响亮失败)。
+func TestRootUseStdAfterRoutePanics(t *testing.T) {
+	app := newTestApp()
+	app.Get("/x", func(ctx *testCtx) { ctx.String(200, "x") })
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("root UseStd after route registration must panic (chi discipline)")
+		}
+	}()
+	app.UseStd(func(next http.Handler) http.Handler { return next })
+}
+
 // --- Mount ---
 
 type testController struct{}
