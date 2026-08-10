@@ -544,7 +544,7 @@ func TestCtxFromForeignContextPanics(t *testing.T) {
 			t.Fatalf("panic should be a pointing message, got: %v", r)
 		}
 	}()
-	CtxFrom[*testCtx](raw)
+	CtxFrom[*testCtx](nil, raw)
 }
 
 // T.R 与链上 r 同一指针 (holder 根治的不变式)。

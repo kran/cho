@@ -21,7 +21,7 @@ import (
 // there is no framework error-to-response conversion.
 // Error responses are the custom Context's job (e.g. ctx.Error(status, msg)
 // defined on your own context struct) — the framework stays concept-free.
-type Handler[T any] func(T)
+type Handler[T CtxIface] func(T)
 
 // StdMw is the standard net/http decorator. chi and any net/http
 // middleware are usable as-is — no generics.
@@ -31,20 +31,25 @@ type StdMw = func(http.Handler) http.Handler
 // to continue the chain (the framework closes over the current w/r), or
 // return without calling it to short-circuit. Access the raw w/r via
 // ctx.Res()/ctx.Req() when needed.
-type CtxMw[T any] func(ctx T, next func())
+type CtxMw[T CtxIface] func(ctx T, next func())
 
-// CtxMaker creates a fresh T from the raw writer/request, once per request.
-// The request passed to the maker is the derived request the chain starts
-// with (cho introduces no context fork of its own). Note: std middleware
-// registered via UseStd may further derive the request (WithContext) —
-// values/deadlines they attach are NOT visible through T's stored request;
-// read the live r from your own middleware layer when that matters.
-type CtxMaker[T any] func(http.ResponseWriter, *http.Request) T
+// CtxMaker creates a fresh T once per request (called by the built-in #0
+// middleware). T 的自定义字段 (Site 等) 在此设置; T 的 W/R 由 CtxFrom
+// 在每个访问点同步为当前值 — maker 里的 w/r 只是初始占位, 无需关心。
+type CtxMaker[T CtxIface] func(http.ResponseWriter, *http.Request) T
+
+// CtxIface 是 typed context 的约束: 两个 setter (W/R 同步点)。
+// 内嵌 BaseContext 自动满足 (它实现了这两个方法); 自定义 context 结构
+// 实现接口即可, 不必内嵌。
+type CtxIface interface {
+	SetResponseWriter(http.ResponseWriter)
+	SetRequest(*http.Request)
+}
 
 // Cho is a thin generic facade over chi.Router. Its only job is to adapt
 // func(T) handlers into http.HandlerFunc; routing, middleware and grouping are
 // all chi's.
-type Cho[T any] struct {
+type Cho[T CtxIface] struct {
 	r      chi.Router
 	maker  CtxMaker[T]
 	prefix string  // Group 累积的路径前缀
@@ -61,31 +66,37 @@ var choCtxKeyInst = &struct{}{}
 // rest of the chain sees (no context fork between maker and handler).
 type choHolder[T any] struct{ v T }
 
-// CtxFrom extracts the typed context T from the request. The context is
-// created by a built-in middleware at position 0 in the chain, so it is
-// available to all subsequent middleware and the handler.
+// CtxFrom extracts the typed context T from the request AND synchronizes
+// T's W/R to the current point's values — the built-in middleware creates
+// T once (shape via maker); every access point (middleware/handler) calls
+// CtxFrom with its own w/r so T always reflects the CURRENT request state
+// (WithContext-derived r, middleware-wrapped w).
 // Panics with a pointing message when the request carries no context of
 // this type (e.g. handlers mounted across Cho instances, or raw chi routes).
-func CtxFrom[T any](r *http.Request) T {
+func CtxFrom[T CtxIface](w http.ResponseWriter, r *http.Request) T {
 	h, ok := r.Context().Value(choCtxKeyInst).(*choHolder[T])
 	if !ok {
 		panic("cho: no context of this type on request — handler/middleware registered outside its Cho[T] instance?")
 	}
-	return h.v
+	t := h.v
+	t.SetResponseWriter(w)
+	t.SetRequest(r)
+	return t
 }
 
 // New creates a Cho backed by a fresh chi router. A built-in middleware at
 // position 0 creates the typed context via ctxMaker and stores it in
 // request.Context, making it available to all subsequent middleware and
 // the handler via CtxFrom.
-func New[T any](em CtxMaker[T]) *Cho[T] {
+//
+// 结构: holder 存 T (创建一次, maker 定形状/自定义字段); T 的 W/R 不在
+// 此处固定 — 每个访问点 (中间件/handler) 经 CtxFrom(w, r) 同步当前值,
+// 消除"位置 0 快照"与"流动请求链"的脱节 (WithContext 派生/响应包装
+// 的 w 都会正确传递)。
+func New[T CtxIface](em CtxMaker[T]) *Cho[T] {
 	c := &Cho[T]{r: chi.NewRouter(), maker: em}
 
-	// Built-in #0 mw: store an empty holder, derive the request context, then
-	// create Ctx from the NEW request and fill the holder — T.R is the same
-	// pointer the rest of the chain sees (no context fork). Never overwrite
-	// *r in place — net/http may hold the request reference after the handler
-	// returns (data race); pass the derived request down.
+	// Built-in #0 mw: 创建 holder + T (maker 定形状); W/R 由 CtxFrom 同步。
 	c.r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			h := &choHolder[T]{}
@@ -105,7 +116,7 @@ func (c *Cho[T]) Router() chi.Router { return c.r }
 // Ctx instance created by the built-in #0 middleware.
 func (c *Cho[T]) wrap(h Handler[T]) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		h(CtxFrom[T](r))
+		h(CtxFrom[T](w, r))
 	}
 }
 
@@ -132,7 +143,7 @@ func (c *Cho[T]) UseCtx(mws ...CtxMw[T]) {
 	for _, mw := range mws {
 		std := func(next http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				mw(CtxFrom[T](r), func() { next.ServeHTTP(w, r) })
+				mw(CtxFrom[T](w, r), func() { next.ServeHTTP(w, r) })
 			})
 		}
 		if c.scoped {

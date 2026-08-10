@@ -61,6 +61,14 @@ func MakeBaseContext(writer http.ResponseWriter, request *http.Request) *BaseCon
 	return &BaseContext{W: writer, R: request}
 }
 
+// SetResponseWriter 更新 W (CtxFrom 在每个访问点同步当前值 — 中间件
+// 包装后的形态)。实现 CtxIface。
+func (b *BaseContext) SetResponseWriter(w http.ResponseWriter) { b.W = w }
+
+// SetRequest 更新 R (CtxFrom 在每个访问点同步当前值 — WithContext 派生
+// 后的形态)。实现 CtxIface。
+func (b *BaseContext) SetRequest(r *http.Request) { b.R = r }
+
 // PathValue 路径参数 — 从 chi 的 RouteContext 读 (参数的真正来源)。
 // 不用 net/http 的 r.PathValue: chi 5.2+ 靠 routeHTTP 里的 SetPathValue
 // 同步, 在 inline (With) 路由 + 中间件场景下同步有失效时序问题
