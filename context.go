@@ -3,6 +3,7 @@ package cho
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/go-chi/chi/v5"
 	"mime/multipart"
 	"net/http"
 	"strconv"
@@ -60,8 +61,21 @@ func MakeBaseContext(writer http.ResponseWriter, request *http.Request) *BaseCon
 	return &BaseContext{W: writer, R: request}
 }
 
+// PathValue 路径参数 — 从 chi 的 RouteContext 读 (参数的真正来源)。
+// 不用 net/http 的 r.PathValue: chi 5.2+ 靠 routeHTTP 里的 SetPathValue
+// 同步, 在 inline (With) 路由 + 中间件场景下同步有失效时序问题
+// (实测: chi URLParams 有值但 r.PathValue 为空)。
 func (b *BaseContext) PathValue(key string) string {
-	return b.R.PathValue(key)
+	rctx := chi.RouteContext(b.R.Context())
+	if rctx == nil {
+		return ""
+	}
+	for i, k := range rctx.URLParams.Keys {
+		if k == key {
+			return rctx.URLParams.Values[i]
+		}
+	}
+	return ""
 }
 
 func (b *BaseContext) Query(key string) string {
