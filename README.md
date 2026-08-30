@@ -193,8 +193,8 @@ Request:
 | `Req` | `() *http.Request` | Raw request |
 | `Res` | `() http.ResponseWriter` | Raw response writer |
 | `Query` | `(key) string` | Query parameter |
-| `QueryInt64` | `(key, def ...int64) int64` | Query parameter as int64; def applies only when absent (empty/unparsable → 0) |
-| `QueryInt` | `(key, def ...int) int` | Query parameter as int; def applies only when absent (empty/unparsable → 0) |
+| `QueryNum` | `(key, def ...int64) int64` | Query parameter as int64; def applies only when absent (empty/unparsable → 0) |
+| `PathNum` | `(key, def ...int64) int64` | Path parameter (chi `{name}` syntax) as int64; def applies only when absent/empty (unparsable → 0) |
 | `PathValue` | `(key) string` | Path parameter (chi `{name}` syntax) |
 | `Form` | `(key) string` | Form value |
 | `Header` | `(key) string` | Request header |

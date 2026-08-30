@@ -2,6 +2,7 @@ package cho
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -29,45 +30,43 @@ func TestQuery(t *testing.T) {
 	}
 }
 
-func TestQueryInt64(t *testing.T) {
+func TestQueryNum(t *testing.T) {
 	ctx, _ := makeCtx("GET", "/test?id=42&bad=abc&empty=&zero=0", "")
-	if ctx.QueryInt64("id") != 42 {
-		t.Errorf("QueryInt64(id) = %d", ctx.QueryInt64("id"))
+	if ctx.QueryNum("id") != 42 {
+		t.Errorf("QueryNum(id) = %d", ctx.QueryNum("id"))
 	}
-	if ctx.QueryInt64("bad") != 0 {
-		t.Errorf("QueryInt64(bad) = %d", ctx.QueryInt64("bad"))
+	if ctx.QueryNum("bad") != 0 {
+		t.Errorf("QueryNum(bad) = %d", ctx.QueryNum("bad"))
 	}
-	if ctx.QueryInt64("missing") != 0 {
-		t.Errorf("QueryInt64(missing) = %d", ctx.QueryInt64("missing"))
+	if ctx.QueryNum("missing") != 0 {
+		t.Errorf("QueryNum(missing) = %d", ctx.QueryNum("missing"))
 	}
 	// default applies only when absent — not for empty/zero
-	if ctx.QueryInt64("missing", 7) != 7 {
-		t.Errorf("QueryInt64(missing, 7) = %d", ctx.QueryInt64("missing", 7))
+	if ctx.QueryNum("missing", 7) != 7 {
+		t.Errorf("QueryNum(missing, 7) = %d", ctx.QueryNum("missing", 7))
 	}
-	if ctx.QueryInt64("empty", 7) != 0 {
-		t.Errorf("QueryInt64(empty, 7) = %d", ctx.QueryInt64("empty", 7))
+	if ctx.QueryNum("empty", 7) != 0 {
+		t.Errorf("QueryNum(empty, 7) = %d", ctx.QueryNum("empty", 7))
 	}
-	if ctx.QueryInt64("zero", 7) != 0 {
-		t.Errorf("QueryInt64(zero, 7) = %d", ctx.QueryInt64("zero", 7))
+	if ctx.QueryNum("zero", 7) != 0 {
+		t.Errorf("QueryNum(zero, 7) = %d", ctx.QueryNum("zero", 7))
 	}
 }
 
-func TestQueryInt(t *testing.T) {
-	ctx, _ := makeCtx("GET", "/test?id=42&bad=abc&empty=", "")
-	if ctx.QueryInt("id") != 42 {
-		t.Errorf("QueryInt(id) = %d", ctx.QueryInt("id"))
+func TestPathNum(t *testing.T) {
+	app := newTestApp()
+	app.Get("/users/{id}", func(ctx *testCtx) {
+		ctx.String(200, fmt.Sprintf("%d", ctx.PathNum("id")))
+	})
+	app.Get("/users/{id}/posts/{pid}", func(ctx *testCtx) {
+		ctx.String(200, fmt.Sprintf("%d", ctx.PathNum("pid")))
+	})
+
+	if w := app.Test("GET", "/users/42", nil); w.Body.String() != "42" {
+		t.Errorf("PathNum(id) = %q, want 42", w.Body.String())
 	}
-	if ctx.QueryInt("bad") != 0 {
-		t.Errorf("QueryInt(bad) = %d", ctx.QueryInt("bad"))
-	}
-	if ctx.QueryInt("missing") != 0 {
-		t.Errorf("QueryInt(missing) = %d", ctx.QueryInt("missing"))
-	}
-	if ctx.QueryInt("missing", 9) != 9 {
-		t.Errorf("QueryInt(missing, 9) = %d", ctx.QueryInt("missing", 9))
-	}
-	if ctx.QueryInt("empty", 9) != 0 {
-		t.Errorf("QueryInt(empty, 9) = %d", ctx.QueryInt("empty", 9))
+	if w := app.Test("GET", "/users/42/posts/7", nil); w.Body.String() != "7" {
+		t.Errorf("PathNum(pid) = %q, want 7", w.Body.String())
 	}
 }
 

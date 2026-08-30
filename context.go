@@ -139,10 +139,10 @@ func (b *BaseContext) ServeFile(filepath string) {
 	http.ServeFile(b.W, b.R, filepath)
 }
 
-// QueryInt64 parses the query parameter as int64. When the parameter is
+// QueryNum parses the query parameter as int64. When the parameter is
 // absent, def (or 0) is returned. A present-but-empty or unparsable value
 // yields 0 — Has() distinguishes "absent" from "explicitly passed".
-func (b *BaseContext) QueryInt64(key string, def ...int64) int64 {
+func (b *BaseContext) QueryNum(key string, def ...int64) int64 {
 	q := b.R.URL.Query()
 	if !q.Has(key) {
 		if len(def) > 0 {
@@ -154,15 +154,19 @@ func (b *BaseContext) QueryInt64(key string, def ...int64) int64 {
 	return n
 }
 
-// QueryInt is QueryInt64 for int. Delegates to QueryInt64 — the parse/absent
-// semantics live in one place. On 32-bit platforms an out-of-range value
-// truncates instead of yielding 0 (documented platform difference).
-func (b *BaseContext) QueryInt(key string, def ...int) int {
-	def64 := make([]int64, len(def))
-	for i, d := range def {
-		def64[i] = int64(d)
+// PathNum parses the path parameter as int64. PathValue returns "" when the
+// key is absent, so def (or 0) is used for an absent/empty path param; a
+// present-but-unparsable value yields 0.
+func (b *BaseContext) PathNum(key string, def ...int64) int64 {
+	p := b.PathValue(key)
+	if p == "" {
+		if len(def) > 0 {
+			return def[0]
+		}
+		return 0
 	}
-	return int(b.QueryInt64(key, def64...))
+	n, _ := strconv.ParseInt(p, 10, 64)
+	return n
 }
 
 func (b *BaseContext) BindJson(v any) error {
