@@ -1,6 +1,6 @@
 # cho
 
-Generic typed HTTP framework for Go 1.22+.
+Generic typed HTTP framework for Go 1.27+.
 
 A thin facade over [chi](https://github.com/go-chi/chi) whose only job is to
 **parameterize the context**: handlers receive a typed `T` (your own context
@@ -13,7 +13,7 @@ middleware, grouping and the rest are all chi's — reused as-is, not reimplemen
 ## Install
 
 ```
-go get codeberg.org/kran/cho
+go get github.com/kran/cho
 ```
 
 ## Quick start
@@ -24,7 +24,7 @@ package main
 import (
     "net/http"
 
-    "codeberg.org/kran/cho"
+    "github.com/kran/cho"
 )
 
 // Your context: embed BaseContext, add request-scoped fields.
@@ -206,11 +206,33 @@ Binding (all run validation — see below):
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `BindJson` | `(v any) error` | Decode JSON body (`json` tags) |
-| `BindQuery` | `(v any) error` | Decode URL query (`schema` tags) |
-| `BindForm` | `(v any) error` | Form body: url-encoded or multipart (`schema` tags, 32 MB memory limit) |
+| `BindJson` | `[T any]() (*T, error)` | Decode JSON body into a new `T` (`json` tags) |
+| `BindQuery` | `[T any]() (*T, error)` | Decode URL query into a new `T` (`schema` tags) |
+| `BindForm` | `[T any]() (*T, error)` | Form body into a new `T`: url-encoded or multipart (`schema` tags, 32 MB memory limit) |
 | `FormFile` | `(key) (multipart.File, *multipart.FileHeader, error)` | Single upload (after BindForm) |
 | `FormFiles` | `(key) ([]*multipart.FileHeader, error)` | Multiple uploads (after BindForm) |
+
+The binder allocates the target and hands it back, so there is nothing to infer
+`T` from — the type argument is always explicit:
+
+```go
+type User struct {
+    Name string `json:"name"`
+}
+
+user, err := ctx.BindJson[User]()
+if err != nil {
+    ctx.Error(400, err.Error())
+    return
+}
+ctx.Json(200, user) // *User
+```
+
+`T` is the **value type** (`User`), not a pointer (`*User`); the result is `*T`.
+Validation (see below) runs before the value is returned, on that same pointer.
+Because these are generic methods (Go 1.27), they cannot appear in an interface,
+be taken as an uninstantiated method value (`f := ctx.BindJson`), or be reached
+via `reflect.MethodByName`.
 
 Response:
 
@@ -252,6 +274,17 @@ type LoginReq struct {
     Email    string `json:"email"    validate:"required,email"`
     Password string `json:"password" validate:"required,min=8"`
 }
+
+app.Post("/login", func(ctx *AppContext) {
+    // BindJson allocates LoginReq, decodes, then runs Validate() and the
+    // pluggable validator — an error means one of them rejected the body.
+    req, err := ctx.BindJson[LoginReq]()
+    if err != nil {
+        ctx.Error(400, err.Error())
+        return
+    }
+    _ = req
+})
 ```
 
 **Validatable interface** — per-struct custom logic:
@@ -300,3 +333,6 @@ go test -race ./...    # race detector
   middleware and the handler — no re-creation, no sync primitives.
 - **std middleware compatible**: any `func(http.Handler) http.Handler` works
   as-is (`UseStd`/`With`).
+- **Go 1.27 baseline**: `BindJson`/`BindQuery`/`BindForm` are generic methods, so
+  the module requires Go 1.27 (older toolchains fail with *"generic method requires
+  go1.27 or later"*). Pin an earlier release if you are stuck on an older Go.

@@ -383,8 +383,8 @@ func TestTestMethod(t *testing.T) {
 func TestTestMethodWithBody(t *testing.T) {
 	app := newTestApp()
 	app.Post("/echo", func(ctx *testCtx) {
-		var v map[string]string
-		if err := ctx.BindJson(&v); err != nil {
+		v, err := ctx.BindJson[map[string]string]()
+		if err != nil {
 			ctx.Error(400, err.Error())
 			return
 		}

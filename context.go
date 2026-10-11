@@ -169,20 +169,39 @@ func (b *BaseContext) PathNum(key string, def ...int64) int64 {
 	return n
 }
 
-func (b *BaseContext) BindJson(v any) error {
+// BindJson decodes the JSON request body into a new value and returns it with
+// validation already run:
+//
+//	user, err := ctx.BindJson[User]()
+//
+// T is the struct type itself, not a pointer to it (T = User, not *User). There
+// is no parameter to infer T from, so the type argument is always explicit.
+//
+// Note (Go 1.27): generic methods cannot be listed in an interface, taken
+// uninstantiated as a method value, or found via reflect.MethodByName.
+func (b *BaseContext) BindJson[T any]() (*T, error) {
 	defer b.R.Body.Close()
-	if err := json.NewDecoder(b.R.Body).Decode(v); err != nil {
-		return fmt.Errorf("bind json error: %w", err)
+	var v T
+	if err := json.NewDecoder(b.R.Body).Decode(&v); err != nil {
+		return nil, fmt.Errorf("bind json error: %w", err)
 	}
-	return b.runValidation(v)
+	if err := b.runValidation(&v); err != nil {
+		return nil, err
+	}
+	return &v, nil
 }
 
-// BindQuery decodes URL query parameters into v using `schema` struct tags.
-func (b *BaseContext) BindQuery(v any) error {
-	if err := formDecoder.Decode(v, b.R.URL.Query()); err != nil {
-		return fmt.Errorf("bind query error: %w", err)
+// BindQuery decodes URL query parameters into a new T using `schema` struct
+// tags, then runs validation. Call as ctx.BindQuery[Query]().
+func (b *BaseContext) BindQuery[T any]() (*T, error) {
+	var v T
+	if err := formDecoder.Decode(&v, b.R.URL.Query()); err != nil {
+		return nil, fmt.Errorf("bind query error: %w", err)
 	}
-	return b.runValidation(v)
+	if err := b.runValidation(&v); err != nil {
+		return nil, err
+	}
+	return &v, nil
 }
 
 // FormFile returns the first uploaded file for the given field name.
@@ -200,8 +219,11 @@ func (b *BaseContext) FormFiles(key string) ([]*multipart.FileHeader, error) {
 }
 
 // BindForm decodes form body (application/x-www-form-urlencoded or multipart/form-data)
-// into v using `schema` struct tags. For multipart/form-data, use a 32 MB default memory limit.
-func (b *BaseContext) BindForm(v any) error {
+// into a new T using `schema` struct tags, then runs validation. Call as
+// ctx.BindForm[Form](). For multipart/form-data, the default memory limit is
+// 32 MB; uploaded files are still reached through FormFile/FormFiles afterwards.
+func (b *BaseContext) BindForm[T any]() (*T, error) {
+	var v T
 	ct := b.R.Header.Get("Content-Type")
 	if strings.HasPrefix(ct, "multipart/") {
 		limit := b.MaxFormMemory
@@ -209,17 +231,20 @@ func (b *BaseContext) BindForm(v any) error {
 			limit = 32 << 20
 		}
 		if err := b.R.ParseMultipartForm(limit); err != nil {
-			return fmt.Errorf("bind form error: %w", err)
+			return nil, fmt.Errorf("bind form error: %w", err)
 		}
 	} else {
 		if err := b.R.ParseForm(); err != nil {
-			return fmt.Errorf("bind form error: %w", err)
+			return nil, fmt.Errorf("bind form error: %w", err)
 		}
 	}
-	if err := formDecoder.Decode(v, b.R.Form); err != nil {
-		return fmt.Errorf("bind form error: %w", err)
+	if err := formDecoder.Decode(&v, b.R.Form); err != nil {
+		return nil, fmt.Errorf("bind form error: %w", err)
 	}
-	return b.runValidation(v)
+	if err := b.runValidation(&v); err != nil {
+		return nil, err
+	}
+	return &v, nil
 }
 
 func (b *BaseContext) Json(status int, v any) error {

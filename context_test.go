@@ -1,8 +1,11 @@
 package cho
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -157,11 +160,12 @@ func TestBindJson(t *testing.T) {
 	ctx, _ := makeCtx("POST", "/", `{"name":"alice","age":30}`)
 	ctx.R.Header.Set("Content-Type", "application/json")
 
-	var v struct {
+	type person struct {
 		Name string `json:"name"`
 		Age  int    `json:"age"`
 	}
-	if err := ctx.BindJson(&v); err != nil {
+	v, err := ctx.BindJson[person]()
+	if err != nil {
 		t.Fatalf("BindJson() error: %v", err)
 	}
 	if v.Name != "alice" || v.Age != 30 {
@@ -171,9 +175,103 @@ func TestBindJson(t *testing.T) {
 
 func TestBindJsonInvalid(t *testing.T) {
 	ctx, _ := makeCtx("POST", "/", `{invalid}`)
-	var v map[string]string
-	if err := ctx.BindJson(&v); err == nil {
+	if _, err := ctx.BindJson[map[string]string](); err == nil {
 		t.Error("BindJson() should return error for invalid JSON")
+	}
+}
+
+// bindTarget pins the generic binder contract: T is the value type (no *T
+// parameter), the result is *T, and Validate runs on the returned value.
+type bindTarget struct {
+	Name string `json:"name"`
+}
+
+func (b *bindTarget) Validate() error {
+	if b.Name == "" {
+		return errors.New("name required")
+	}
+	return nil
+}
+
+func TestBindJsonReturnsTypedValue(t *testing.T) {
+	ctx, _ := makeCtx("POST", "/", `{"name":"bob"}`)
+	v, err := ctx.BindJson[bindTarget]()
+	if err != nil {
+		t.Fatalf("BindJson[bindTarget]() error: %v", err)
+	}
+	if v.Name != "bob" {
+		t.Errorf("got %+v", v)
+	}
+}
+
+func TestBindJsonRunsValidation(t *testing.T) {
+	ctx, _ := makeCtx("POST", "/", `{}`)
+	if _, err := ctx.BindJson[bindTarget](); err == nil {
+		t.Error("BindJson should surface the Validate() error")
+	}
+}
+
+func TestBindFormUrlencoded(t *testing.T) {
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/", strings.NewReader("name=alice&age=30"))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	ctx := &BaseContext{W: w, R: r}
+
+	v, err := ctx.BindForm[struct {
+		Name string `schema:"name"`
+		Age  int    `schema:"age"`
+	}]()
+	if err != nil {
+		t.Fatalf("BindForm() error: %v", err)
+	}
+	if v.Name != "alice" || v.Age != 30 {
+		t.Errorf("got %+v", v)
+	}
+}
+
+func TestBindFormMultipart(t *testing.T) {
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	if err := mw.WriteField("name", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	fw, err := mw.CreateFormFile("avatar", "a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fw.Write([]byte("filedata")); err != nil {
+		t.Fatal(err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/", &buf)
+	r.Header.Set("Content-Type", mw.FormDataContentType())
+	ctx := &BaseContext{W: w, R: r}
+
+	v, err := ctx.BindForm[struct {
+		Name string `schema:"name"`
+	}]()
+	if err != nil {
+		t.Fatalf("BindForm() error: %v", err)
+	}
+	if v.Name != "alice" {
+		t.Errorf("Name = %q, want alice", v.Name)
+	}
+
+	f, fh, err := ctx.FormFile("avatar")
+	if err != nil {
+		t.Fatalf("FormFile() error: %v", err)
+	}
+	defer f.Close()
+	if fh.Filename != "a.txt" {
+		t.Errorf("Filename = %q, want a.txt", fh.Filename)
+	}
+	files, err := ctx.FormFiles("avatar")
+	if err != nil || len(files) != 1 {
+		t.Errorf("FormFiles() = %v, %v", files, err)
 	}
 }
 
@@ -242,10 +340,10 @@ func TestMakeBaseContext(t *testing.T) {
 
 func TestBindQueryIgnoresUnknownKeys(t *testing.T) {
 	ctx, _ := makeCtx("GET", "/?name=alice&_cacheBust=123", "")
-	var v struct {
+	v, err := ctx.BindQuery[struct {
 		Name string `schema:"name"`
-	}
-	if err := ctx.BindQuery(&v); err != nil {
+	}]()
+	if err != nil {
 		t.Fatalf("BindQuery should ignore unknown keys, got: %v", err)
 	}
 	if v.Name != "alice" {
