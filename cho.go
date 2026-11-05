@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"strings"
 	"syscall"
 	"time"
 
@@ -231,7 +232,18 @@ func (c *Cho[T]) Start(port int, server ...*http.Server) (*http.Server, <-chan e
 	} else {
 		srv = &http.Server{}
 	}
-	srv.Addr = fmt.Sprintf(":%d", port)
+	// 🔴 只有调用方**没给** Addr 时才用 ":port"。
+	//
+	// 原来这里无条件覆盖，导致传进来的 `http.Server{Addr: "127.0.0.1:8080"}`
+	// 被换成 `:8080` = **监听所有网卡**。表现很阴：
+	// 配置里写着 127.0.0.1、`ss` 一看却是 `*:8080`；
+	// 平时没出事是因为 systemd 的 `IPAddressDeny=any` 挡着，
+	// 而那个沙箱同时也把**出网**掐了（汇率、外部数据源全连不上）。
+	if srv.Addr == "" {
+		srv.Addr = fmt.Sprintf(":%d", port)
+	} else if !strings.Contains(srv.Addr, ":") {
+		srv.Addr = fmt.Sprintf("%s:%d", srv.Addr, port)
+	}
 	srv.Handler = c
 	ln, err := net.Listen("tcp", srv.Addr)
 	if err != nil {
